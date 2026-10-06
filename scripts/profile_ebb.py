@@ -21,6 +21,8 @@ def parse_args(argv=None):
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--skip-calibration", action="store_true")
     parser.add_argument("--calibration-samples", type=int)
+    parser.add_argument("--calibration-length", type=int,
+                        help="Override calibration tokens; default caps YAML length at effective prefill")
     parser.add_argument("--prefill-length", type=int)
     parser.add_argument("--decode-steps", type=int)
     parser.add_argument("--checkpoint-every", type=int, default=32)
@@ -29,6 +31,25 @@ def parse_args(argv=None):
     parser.add_argument("--greedy-decode", action="store_true",
                         help="generate tokens; default uses teacher-forced tokens from the document")
     return parser.parse_args(argv)
+
+
+def resolve_workload(config, args):
+    """Keep calibration within the profiling memory budget unless explicitly overridden."""
+    pd = config["prefill_decode_profile"]
+    prefill = args.prefill_length if args.prefill_length is not None else pd["prefill_length"]
+    decode = args.decode_steps if args.decode_steps is not None else pd["decode_steps"]
+    if prefill <= 0 or decode < 0:
+        raise ValueError("prefill must be positive and decode must be nonnegative")
+    cc = config["calibration"]
+    length = (args.calibration_length if args.calibration_length is not None
+              else min(cc.get("seq_length", prefill), prefill))
+    samples = args.calibration_samples if args.calibration_samples is not None else cc.get("num_samples", 64)
+    if args.checkpoint_every <= 0 or length <= 0 or samples <= 0:
+        raise ValueError("checkpoint-every, calibration-length and calibration-samples must be positive")
+    pd.update(prefill_length=prefill, decode_steps=decode)
+    cc.update(seq_length=length, num_samples=samples, batch_size=1,
+              min_text_tokens=min(cc.get("min_text_tokens", length), length))
+    return prefill, decode
 
 
 def validate_config(config):
@@ -105,13 +126,7 @@ def main(argv=None):
     if args.scale_dir is not None:
         config["quantization"]["scale_dir"] = str(args.scale_dir)
     validate_config(config)
-    prefill = (args.prefill_length if args.prefill_length is not None
-               else config["prefill_decode_profile"]["prefill_length"])
-    decode = args.decode_steps if args.decode_steps is not None else config["prefill_decode_profile"]["decode_steps"]
-    if prefill <= 0 or decode < 0:
-        raise ValueError("prefill must be positive and decode must be nonnegative")
-    if args.checkpoint_every <= 0 or (args.calibration_samples is not None and args.calibration_samples <= 0):
-        raise ValueError("checkpoint-every and calibration-samples must be positive")
+    prefill, decode = resolve_workload(config, args)
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable; select --device cpu for a small-model smoke run")
     if importlib.metadata.version("transformers") != "4.43.1":
@@ -142,20 +157,21 @@ def main(argv=None):
     if len(modules) != expected:
         raise RuntimeError(f"Expected {expected} quantized operators, found {len(modules)}")
     actions = [m._resolve_calibration_action() for m in modules]
+    cc = config["calibration"]
+    calibration_batches = 0
     if "recalibrate" in actions:
-        cc = config["calibration"]
-        samples = args.calibration_samples or cc.get("num_samples", 64)
         loader = CalibrationDataLoader(cc["dataset"], cc.get("dataset_config"), cc.get("split", "train"),
-                    args.model_path, seq_length=cc.get("seq_length", prefill), batch_size=1,
-                    num_samples=samples, seed=cc.get("seed", 23), text_column=cc.get("text_column", "text"),
-                    streaming=cc.get("streaming", True), min_text_tokens=cc.get("min_text_tokens", 4096))
+                    args.model_path, seq_length=cc["seq_length"], batch_size=1,
+                    num_samples=cc["num_samples"], seed=cc.get("seed", 23), text_column=cc.get("text_column", "text"),
+                    streaming=cc.get("streaming", True), min_text_tokens=cc["min_text_tokens"])
         from tqdm import tqdm
         with torch.no_grad():
             for batch in tqdm(loader, desc="Calibrating"):
                 # LM head is outside this collection's scope; avoid materializing
-                # an [8192,vocabulary] logits tensor during calibration/prefill.
+                # a [sequence_length,vocabulary] logits tensor during calibration/prefill.
                 model.model(input_ids=batch["input_ids"].to(args.device),
                             attention_mask=batch["attention_mask"].to(args.device), use_cache=False)
+                calibration_batches += 1
         calibration_manager.save_all_scales()
     switch_quantization_mode_all(model, "quant_forward")
     ebb = dict(config["ebb"], trace_path=str(args.output_dir / "ebb_trace.jsonl"))
@@ -169,6 +185,10 @@ def main(argv=None):
                     decode_mode="greedy" if args.greedy_decode else "teacher_forced",
                     transport=dict(linear_weight="packed_int4", kv_cache="fp8"),
                     torch_version=torch.__version__, transformers_version=importlib.metadata.version("transformers"),
+                    calibration=dict(cc, performed=calibration_batches > 0,
+                                     completed_batches=calibration_batches,
+                                     operators_recalibrated=actions.count("recalibrate"),
+                                     operators_reused=actions.count("reuse")),
                     quantization=quant)
     workload.update(status="running", completed_decode_steps=0)
     (args.output_dir / "run_config.json").write_text(json.dumps(

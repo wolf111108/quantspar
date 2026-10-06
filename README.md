@@ -17,4 +17,4 @@ python -m scripts.profile_fp8_int4 --demo --output outputs/fp8_int4_demo.json
 - [每次提交的修改记录](CHANGELOG.md)
 - [提交维护规则](AGENTS.md)
 
-Qwen 包装器与校准加载器已经上传。全模型依赖见 `requirements-model.txt`；EBB 使用独立的 `scripts.profile_ebb` 入口和 `qwen2_14b_ebb_f8i4.yaml` 配置，默认收集 8192 prefill＋1024 decode。EBB 输出是基于显式 FP8 对齐和调度假设的 GEMM 周期范围，不是论文测得的 FP8 性能或端到端时延。完整 14B checkpoint 与 CUDA 实验需本地运行。
+Qwen 包装器与校准加载器已经上传。全模型依赖见 `requirements-model.txt`；EBB 使用独立的 `scripts.profile_ebb` 入口和 `qwen2_14b_ebb_f8i4.yaml` 配置，默认收集 8192 prefill＋1024 decode。内存有限时使用 `config/qwen2_14b_ebb_f8i4_2048_256.yaml`，校准和 profiling 都缩短，scale 目录独立；命令行缩短 prefill 也会默认限制校准长度。EBB 输出是基于显式 FP8 对齐和调度假设的 GEMM 周期范围，不是论文测得的 FP8 性能或端到端时延。完整 14B checkpoint 与 CUDA 实验需本地运行。

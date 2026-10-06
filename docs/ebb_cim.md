@@ -1,6 +1,6 @@
 # EBB-CIM / MulTCIM 统计与本地运行
 
-目标：Qwen2.5-14B，batch=1，Linear IA E4M3FN、W INT4；prefill=8192，decode=1024；片外 Linear 权重按紧凑 W4，KV 按 FP8。LM head、Softmax、RMSNorm、RoPE、SiLU 的系统时延继续使用 LLMCompass 的配置。
+目标：Qwen2.5-14B，batch=1，Linear IA E4M3FN、W INT4；片外 Linear 权重按紧凑 W4，KV 按 FP8。提供 8192＋1024 与内存较省的 2048＋256 两种工作负载。LM head、Softmax、RMSNorm、RoPE、SiLU 的系统时延继续使用 LLMCompass 的配置，并按最终目标长度重新计算。
 
 本后端采集真实量化 codes，输出有效位宽分布、分组失衡、位宽溢出、条件 GEMM 周期范围和最低必需搬运字节数。它不调用原 Asyn-CIM 的尾数 popcount 映射，也不修改原实验 YAML。
 
@@ -11,12 +11,25 @@
 ```bash
 python -m pip install -r requirements-model.txt
 python -m scripts.profile_ebb \
+  --config config/qwen2_14b_ebb_f8i4_2048_256.yaml \
+  --model-path /path/to/Qwen2.5-14B \
+  --output-dir outputs/ebb_qwen14b_2048_256
+```
+
+短配置同时把校准长度设为 2048，保持 64 个样本和 batch=1，scale 单独保存到 `quant/scales/qwen2_14b_ebb_f8i4_2048/`。teacher-forced 输入文档至少需要 2304 tokens；`--greedy-decode` 只需 2048-token prompt。
+
+完整长序列配置仍可运行：
+
+```bash
+python -m scripts.profile_ebb \
   --config config/qwen2_14b_ebb_f8i4.yaml \
   --model-path /path/to/Qwen2.5-14B \
   --output-dir outputs/ebb_qwen14b_8192_1024
 ```
 
-输出目录必须是新目录。默认校准 FineWeb 的 64 个 8192-token 样本（seed=23），量化 scale 保存到新的 `quant/scales/qwen2_14b_ebb_f8i4/`。第一次不要传 `--skip-calibration`；再次运行同一量化/校准配置时可传该参数复用 scale。旧 outlier、INT8 或不同粒度的 scale 不能复制到新目录。
+输出目录必须是新目录。长配置校准 FineWeb 的 64 个 8192-token 样本（seed=23），量化 scale 保存到 `quant/scales/qwen2_14b_ebb_f8i4/`。第一次不要传 `--skip-calibration`；再次运行同一量化/校准配置时可传该参数复用 scale。旧 outlier、INT8 或不同粒度的 scale 不能复制到新目录。
+
+`--prefill-length` 缩短 profiling 时，校准长度默认取 `min(YAML 校准长度, 实际 prefill 长度)`，文档筛选的最低 token 数也相应封顶，避免 profiling 已缩短但仍校准 8192 tokens。可用 `--calibration-length` 显式覆盖；`--calibration-samples` 只改变样本数。使用已有 scale 时不会因为改长度而自动重校准；不同校准实验需指定独立 `--scale-dir`。输出记录请求的有效校准配置、是否实际校准、完成 batch 数和复用/重校准算子数；复用时该配置不代表已有 scale 的生成历史。
 
 先核对接口和缓存增长，可运行较短的 profiling：
 
@@ -28,9 +41,9 @@ python -m scripts.profile_ebb \
   --prefill-length 128 --decode-steps 4 --calibration-samples 1
 ```
 
-这仍使用 YAML 的 8192-token 校准长度；1 个校准样本只用于接口检查。测试 scale 使用独立目录，正式命令使用默认新目录并按 64 样本重校准。
+该命令校准和 prefill 都使用 128 tokens；1 个校准样本只用于接口检查。测试 scale 使用独立目录，正式命令使用对应配置的新目录并按 64 样本重校准。
 
-默认 decode 是 teacher-forced：从同一文档读取后续 1024 个 token，逐个带 cache 推理。输入文档需至少 9216 tokens。`--greedy-decode` 改为模型自身生成；此时只需 8192-token prompt，会调用 LM head 选择 token，LM head 不进入 EBB GEMM 统计。
+默认 decode 是 teacher-forced：从同一文档读取后续 token，逐个带 cache 推理。长配置需要至少 9216 tokens。`--greedy-decode` 改为模型自身生成；长配置只需 8192-token prompt，会调用 LM head 选择 token，LM head 不进入 EBB GEMM 统计。
 
 已有固定 token 输入可使用 `--token-file tokens.pt`，文件为 `torch.save(torch.long_tensor)`，形状 `[tokens]` 或 `[1,tokens]`，也支持 `{"input_ids": tensor}`。这可以绕过 profiling 的在线文档加载；首次校准仍使用配置的校准数据集。
 
@@ -40,11 +53,13 @@ python -m scripts.profile_ebb \
 |---|---|
 | `ebb_summary.json` | 每 layer/operator/phase 的计数与位宽直方图、phase 周期/秒数、逐 step 合计、原生位宽覆盖检查、建模假设与缺失系统参数 |
 | `ebb_trace.jsonl` | 每次算子调用的 shape、宏布局、周期、GQA/cache 信息、最低搬运量及溢出计数；不保存大张量 |
-| `run_config.json` | 运行设置、模型维度和软件版本 |
+| `run_config.json` | 运行设置、有效校准配置与执行情况、模型维度和软件版本 |
 
-每 32 个 decode step 写一次汇总检查点；`--checkpoint-every` 可调整。异常退出时保存已完成计数，`workload.status` 为 `interrupted`，不能作为完成实验。成功时是 `complete`，`completed_decode_steps=1024`。
+每 32 个 decode step 写一次汇总检查点；`--checkpoint-every` 可调整。异常退出时保存已完成计数，`workload.status` 为 `interrupted`，不能作为完成实验。成功时是 `complete`，短配置的 `completed_decode_steps=256`，长配置为 1024。
 
 Qwen2.5-14B 应有 48 层，每层 7 Linear＋QK＋PV：prefill 432 次调用，decode 442368 次调用。完整 trace 共 442800 行。decode `cache_length_before` 为 8192…9215，`cache_length_after` 为 8193…9216。
+
+2048＋256 配置的 prefill 同为 432 次调用，decode 为 110592 次，共 111024 行。decode `cache_length_before` 为 2048…2303，`cache_length_after` 为 2049…2304。
 
 `phases.<phase>.compute_seconds` 有三个字段：
 
@@ -53,6 +68,26 @@ Qwen2.5-14B 应有 48 层，每层 7 Linear＋QK＋PV：prefill 432 次调用，
 - `ideal_balanced`：理想组内平衡的周期下界。
 
 全部是条件计算模型，单位为秒；不是 Python/GPU 程序运行时间，也没有包含片外搬运、CIM 写入或非 GEMM。要获取整个工作负载的条件 GEMM 范围，分别相加 prefill 与 decode 的 `ideal_balanced`、`leading_zero`。不要把倍率乘在已有稀疏 TOPS 上。
+
+## 用 2048＋256 估计长序列
+
+若最终比较的工作负载改成 2048＋256，所有架构统一该长度，直接使用短配置统计。若目标仍是 8192＋1024，短运行只能提供稀疏统计样本，最终结果需标明是短序列外推。
+
+同一模型、batch 和精度下，先按目标长度重新计算逻辑工作量：
+
+| 项目 | 8192＋1024 相对 2048＋256 | 口径 |
+|---|---|---|
+| prefill Linear MAC | ×4 | 与 prompt 长度 S 成正比 |
+| decode Linear MAC | ×4 | 与 decode 步数 D 成正比 |
+| prefill QK/PV MAC | ×16 | 当前 eager 路径计算完整 S×S，因果 mask 不改变 GEMM shape |
+| decode QK/PV MAC | 约 ×16（15.99724） | cache 含本步新 token：`D*S + D*(D+1)/2` |
+| decode 历史 KV 最低读取量 | 约 ×16（16.00276） | cache 写入前长度：`D*S + D*(D-1)/2`，不含片上保留/重复读策略 |
+| KV append 字节数 | ×4 | prefill 与 decode 分别与 S、D 成正比 |
+| Linear W4 最低读取量 | prefill ×1；decode ×4 | 每次 Linear 最少读一次完整权重；真实 refill 另算 |
+
+这些倍率是 MAC/最低字节数倍率，不能直接乘在短运行的 GEMM 秒数或总时延上。需以目标 M/K/N 重新选择宏布局、计算 tiling/refill，并按重叠规则合并计算与搬运。沿用 LLMCompass 的硬件/算子设置时，非 GEMM 时延也应按目标 shape 重算。
+
+EBB 的有效位宽和组内失衡可能随上下文改变，尤其 PV 的 Softmax 概率和动态 K/V。复用短统计等价于假设各 layer/operator/phase 的位宽分布在长序列仍适用；2048 的测量不能验证该假设，也不能确认 8192 时的位宽溢出率。保留各算子统计，避免把全模型平均加速比统一乘到所有 GEMM 上。当前入口导出的秒数只对应实际运行长度，未自动生成长序列端到端结果。
 
 ## 对照论文的统计定义
 
@@ -109,4 +144,4 @@ Qwen2.5-14B 应有 48 层，每层 7 Linear＋QK＋PV：prefill 432 次调用，
 python -m unittest discover -s tests -v
 ```
 
-核心依赖下运行数学/编码与原 Asyn 回归；安装 `requirements-model.txt` 后，额外运行真实小型 Qwen 的 prefill/decode/FP8-cache 测试，以及保存模型后通过 CLI 的 teacher-forced/greedy 冒烟验证。完整 14B、8192＋1024 和 CUDA 性能由本地实验验证。
+核心依赖下运行数学/编码与原 Asyn 回归；安装 `requirements-model.txt` 后，额外运行真实小型 Qwen 的 prefill/decode/FP8-cache 测试，以及保存模型后通过 CLI 的 teacher-forced/greedy 冒烟验证。校准回归用本地 tensor loader 替代在线数据源，对真实保存模型执行校准和推理，确认短 prefill 自动限制校准长度，显式 `--calibration-length` 可以覆盖。完整 14B、两种工作负载和 CUDA 性能由本地实验验证。

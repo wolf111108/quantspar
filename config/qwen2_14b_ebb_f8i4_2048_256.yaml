@@ -1,0 +1,126 @@
+# Short EBB experiment for memory-limited local profiling.
+# Calibration scales are isolated from the 8192-token experiment.
+# FP8 alignment and INT16 banking are explicit analytical extensions.
+model:
+  name: qwen2.5-14b
+  family: qwen2
+  path: models/Qwen2.5-14B
+  num_layers: 48
+  attn_implementation: eager
+quantization:
+  enabled: true
+  mode: quant_forward
+  model_family: qwen2
+  quantize_linear: true
+  quantize_matmul: true
+  scale_dir: quant/scales/qwen2_14b_ebb_f8i4_2048/
+  calibration_policy:
+    default: auto
+  q_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  k_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  v_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  o_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  gate_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  up_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  down_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  qk_matmul:
+    A_bit: e4m3
+    B_bit: e4m3
+    O_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  pv_matmul:
+    A_bit: e4m3
+    B_bit: e4m3
+    O_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  lm_head:
+    enabled: false
+  mixed_precision: false
+  dynamic_activation: false
+  weight_scale_granularity: scalar
+  shared_kv_gqa: true
+  kv_cache:
+    fp8_static: true
+calibration:
+  dataset: HuggingFaceFW/fineweb
+  dataset_config: sample-10BT
+  split: train
+  streaming: true
+  text_column: text
+  min_text_tokens: 2048
+  num_samples: 64
+  seq_length: 2048
+  batch_size: 1
+  seed: 23
+prefill_decode_profile:
+  enabled: true
+  prefill_length: 2048
+  decode_steps: 256
+  dataset: HuggingFaceFW/fineweb
+  dataset_config: sample-10BT
+  split: train
+  streaming: true
+  text_column: text
+  sample_offset: 0
+  start_offset: 0
+ebb:
+  enabled: true
+  input_bits: 16
+  linear_weight_bits: 8
+  attention_weight_bits: 16
+  frequency_hz: 160000000.0
+  macros: 128
+  arrays_per_macro: 32
+  banks: 8
+  rows: 4
+  group_size: 8
+  chunk_rows: 32
+  fp8_alignment: exact_dyadic
+  signed_encoding: twos_complement
+  group_setup_cycles: 0

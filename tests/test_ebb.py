@@ -1,12 +1,15 @@
 """EBB bounds, code representation, traffic and real tiny-Qwen integration."""
 from dataclasses import replace
+from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 import torch
 from quant import QuantStatManager
@@ -186,7 +189,7 @@ class EBBTests(unittest.TestCase):
 
     @unittest.skipUnless(importlib.util.find_spec('transformers') and importlib.util.find_spec('datasets'),
                          'Install requirements-model.txt')
-    def test_local_profile_cli_teacher_forced_and_greedy(self):
+    def test_local_profile_cli_teacher_forced_greedy_and_short_calibration(self):
         import yaml
         from transformers import Qwen2Config, Qwen2ForCausalLM, PreTrainedTokenizerFast
         from tokenizers import Tokenizer
@@ -225,9 +228,57 @@ class EBBTests(unittest.TestCase):
                 doc = json.loads((tmp/mode/'ebb_summary.json').read_text())
                 self.assertEqual(doc['workload']['status'], 'complete')
                 self.assertEqual(doc['workload']['completed_decode_steps'], 3)
+                self.assertFalse(doc['workload']['calibration']['performed'])
                 self.assertEqual(doc['phases']['prefill']['counts']['calls'], 9)
                 self.assertEqual(doc['phases']['decode']['counts']['calls'], 27)
                 self.assertEqual(len((tmp/mode/'ebb_trace.jsonl').read_text().splitlines()), 36)
+
+            # Run actual calibration/forward passes against a saved checkpoint.
+            # The source YAML still says 8192; neither loader nor model may use it
+            # when profiling eight tokens, unless calibration is explicitly overridden.
+            from transformers import AutoModelForCausalLM
+            from scripts.profile_ebb import main
+            original_load = AutoModelForCausalLM.from_pretrained
+            for calibration_length in (None, 16):
+                seen_lengths = []
+
+                def load_local_model(*args, **kwargs):
+                    loaded = original_load(*args, **kwargs)
+                    loaded.model.register_forward_pre_hook(
+                        lambda module, positional, kw: seen_lengths.append(
+                            (kw['input_ids'] if 'input_ids' in kw else positional[0]).shape[-1]),
+                        with_kwargs=True)
+                    return loaded
+
+                def local_calibration_loader(*args, **kwargs):
+                    ids = torch.arange(kwargs['seq_length']).reshape(1, -1) % 64
+                    return [dict(input_ids=ids, attention_mask=torch.ones_like(ids))]
+
+                name = 'auto_calibration' if calibration_length is None else 'explicit_calibration'
+                arguments = ['--config', str(cfg_file), '--model-path', str(model_dir),
+                             '--output-dir', str(tmp/name), '--scale-dir', str(tmp/(name+'_scales')),
+                             '--token-file', str(tmp/'tokens.pt'), '--device', 'cpu',
+                             '--prefill-length', '8', '--decode-steps', '3', '--calibration-samples', '1']
+                if calibration_length is not None:
+                    arguments += ['--calibration-length', str(calibration_length)]
+                with mock.patch('transformers.AutoModelForCausalLM.from_pretrained',
+                                side_effect=load_local_model), \
+                     mock.patch('others.data.CalibrationDataLoader',
+                                side_effect=local_calibration_loader) as loader, \
+                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    main(arguments)
+                length = 8 if calibration_length is None else calibration_length
+                self.assertEqual(loader.call_args.kwargs['seq_length'], length)
+                self.assertEqual(loader.call_args.kwargs['min_text_tokens'], length)
+                self.assertEqual(seen_lengths, [length, 8, 1, 1, 1])
+                doc = json.loads((tmp/name/'ebb_summary.json').read_text())
+                self.assertEqual(doc['workload']['status'], 'complete')
+                self.assertTrue(doc['workload']['calibration']['performed'])
+                self.assertEqual(doc['workload']['calibration']['seq_length'], length)
+                self.assertEqual(doc['workload']['calibration']['completed_batches'], 1)
+                self.assertEqual(doc['workload']['calibration']['operators_recalibrated'], 9)
+                self.assertEqual(doc['workload']['calibration']['operators_reused'], 0)
+                self.assertEqual(doc['phases']['decode']['counts']['calls'], 27)
 
 
 if __name__ == '__main__':
