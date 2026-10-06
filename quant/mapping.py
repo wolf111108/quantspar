@@ -1,5 +1,12 @@
 from dataclasses import dataclass
 
+def Mapping_stat_bitlet(activation, weight, a_spec, b_spec, in_features,
+                        out_features, config, phase="prefill", seed=None):
+    """Bitlet BCE column work; independent of Asyn-CIM and EBB ratios."""
+    from .bitlet import measure_bitlet_mapping
+    return measure_bitlet_mapping(activation, weight, a_spec, b_spec, in_features,
+                                  out_features, config, phase, seed)
+
 def Mapping_stat_ebb(activation, spec, in_features, out_features, config, weight_bits=8):
     """Separate MulTCIM-inspired bounds; never reuse Asyn-CIM popcount ratios."""
     from .ebb import measure_ebb_mapping
@@ -863,3 +870,4 @@ def sy_latency(CIM, x, in_features, out_features, is_prefill=True):
     result=measure_mapping(CIM,x,"e4m3",in_features,out_features,is_prefill,asynchronous=False)
     nr=result["layout"][-1];sparse=result["sparse_steps"];dense=result["dense_steps"]
     return sparse/nr,sparse/nr,dense/nr,sparse,dense,sparse
+

@@ -142,7 +142,7 @@ class QuantStatManager:
     def __init__(self, scale_dir: str, nmacro: int = 32, as_l: int = 1, *,
                  h: int = 64, w: int = 48, banks: int = 16,
                  bit_scope: str = "mantissa", cycles_per_effective_bit: float = 1,
-                 ebb_config=None):
+                 ebb_config=None, bitlet_config=None):
         """
         Initialize statistics manager.
 
@@ -163,11 +163,19 @@ class QuantStatManager:
         self.bit_scope = bit_scope
         self.cim_records = []
         self.ebb_stats = None
+        self.bitlet_stats = None
         self.execution_context = {}
         self.attention_context = {}
+        if (ebb_config is not None and ebb_config.get("enabled", True) and
+                bitlet_config is not None and bitlet_config.get("enabled", True)):
+            raise ValueError("Enable only one architecture collector per run")
         if ebb_config is not None and ebb_config.get("enabled", True):
             from .ebb import EBBConfig, EBBStats
             self.ebb_stats = EBBStats(EBBConfig.from_dict(ebb_config), ebb_config.get("trace_path"))
+        if bitlet_config is not None and bitlet_config.get("enabled", True):
+            from .bitlet import BitletConfig, BitletStats
+            self.bitlet_stats = BitletStats(BitletConfig.from_dict(bitlet_config),
+                                            bitlet_config.get("trace_path"))
         self._static_weights_seen = set()
         self.stats: Dict[str, QuantStatistics] = {}
         self.hooks: List[Any] = []
@@ -363,13 +371,20 @@ class QuantStatManager:
             raise ValueError("EBB backend is not enabled")
         return self.ebb_stats.export(path, workload)
 
+    def export_bitlet_stats(self, path, workload=None, other_latency=None):
+        if self.bitlet_stats is None:
+            raise ValueError("Bitlet backend is not enabled")
+        return self.bitlet_stats.export(path, workload, other_latency)
+
     def close(self):
         if self.ebb_stats is not None:
             self.ebb_stats.close()
+        if self.bitlet_stats is not None:
+            self.bitlet_stats.close()
 
     def reset_sparsity(self):  #add
-        if self.ebb_stats is not None:
-            raise ValueError("Use a new EBB manager per run; reset would invalidate streamed trace")
+        if self.ebb_stats is not None or self.bitlet_stats is not None:
+            raise ValueError("Use a new architecture manager per run; reset would invalidate streamed trace")
         self.cim_records.clear();self._static_weights_seen.clear();self.per_layer_latency.clear()
         for prefix in ('activation','weight','dynamic_weight'):
             for suffix in ('zero_count','element_count','bit_count','0bit_count','sparsebit_count',
@@ -2263,6 +2278,12 @@ class QuantStatManager:
                                  weight,weight_spec,spec,digit_size,parallelism,
                                  in_features,out_features):
         if activation is None or spec is None or spec.kind == "none": return
+        if self.bitlet_stats is not None:
+            context = dict(self.execution_context)
+            context.update(self.attention_context.get((layer_name, layer_idx), {}))
+            return self.bitlet_stats.collect(layer_name, layer_idx, activation, weight,
+                                             spec, weight_spec, in_features, out_features,
+                                             self.current_phase, context)
         if self.ebb_stats is not None:
             context = dict(self.execution_context)
             context.update(self.attention_context.get((layer_name, layer_idx), {}))
@@ -2315,8 +2336,8 @@ class QuantStatManager:
         entry['speed_up']=entry['baseline_latency']/entry['SACIM_latency'] if entry['SACIM_latency']>0 else None
 
     def export_cim_stats(self,path):
-        if self.ebb_stats is not None:
-            raise ValueError("EBB results require export_ebb_stats, not the Asyn-CIM schema")
+        if self.ebb_stats is not None or self.bitlet_stats is not None:
+            raise ValueError("Architecture results require their own export, not the Asyn-CIM schema")
         import json
         from pathlib import Path
         doc=dict(schema_version=1,bit_scope=self.bit_scope,geometry=self.cim_geometry,
@@ -2333,8 +2354,8 @@ class QuantStatManager:
         This is one average per operator/phase, not a per-layer/context trace.
         Missing operators, all-zero costs and unmatched GQA are rejected.
         """
-        if self.ebb_stats is not None:
-            raise ValueError("The Asyn-CIM LLMCompass bridge cannot import EBB bounds")
+        if self.ebb_stats is not None or self.bitlet_stats is not None:
+            raise ValueError("The Asyn-CIM LLMCompass bridge cannot import other architectures")
         import json
         from pathlib import Path
         if self.as_l!=1: raise ValueError("LLMCompass import requires asynchronous mapping")
@@ -2828,3 +2849,4 @@ class QuantStatManager:
         for hook in self.hooks:
             hook.remove()
         self.hooks.clear()
+

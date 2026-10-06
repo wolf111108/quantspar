@@ -4,6 +4,7 @@ from copy import deepcopy
 import importlib.metadata
 import json
 from pathlib import Path
+import subprocess
 
 import torch
 from quant import load_config, QuantStatManager, QuantizedLinear, QuantizedMatMul
@@ -19,6 +20,14 @@ LINEARS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down
 TRANSFORMERS_MIN = (4, 40)
 TRANSFORMERS_MAX_EXCLUSIVE = (4, 45)
 
+def source_git_commit():
+    root = Path(__file__).resolve().parents[1]
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root,
+                                       text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
 
 def transformers_version_tuple(raw):
     parts = []
@@ -30,9 +39,12 @@ def transformers_version_tuple(raw):
     return tuple(parts)
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=Path("config/qwen2_14b_ebb_f8i4.yaml"))
+def parse_args(argv=None, backend="ebb"):
+    parser = argparse.ArgumentParser(description=(
+        "Local Qwen FP8/W4 Bitlet column and latency collection." if backend == "bitlet" else __doc__))
+    default_config = ("config/qwen2_14b_bitlet_f8i4_2048_256.yaml" if backend == "bitlet"
+                      else "config/qwen2_14b_ebb_f8i4.yaml")
+    parser.add_argument("--config", type=Path, default=Path(default_config))
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--scale-dir", type=Path, help="Override scale directory, e.g. isolate smoke calibration")
@@ -48,6 +60,14 @@ def parse_args(argv=None):
                         help="torch.save LongTensor [tokens], or dict with input_ids; no dataset needed")
     parser.add_argument("--greedy-decode", action="store_true",
                         help="generate tokens; default uses teacher-forced tokens from the document")
+    if backend == "bitlet":
+        parser.add_argument("--exact", action="store_true", help="Enumerate every BCE tile (expensive for 14B)")
+        parser.add_argument("--prefill-sample-waves", type=int,
+                            help="Uniform waves per operand/call; 0 means exact")
+        parser.add_argument("--decode-sample-waves", type=int,
+                            help="Uniform waves per operand/call; 0 means exact")
+        parser.add_argument("--other-latency-json", type=Path,
+                            help="Remaining operator latency including LM head, in seconds")
     return parser.parse_args(argv)
 
 
@@ -70,14 +90,15 @@ def resolve_workload(config, args):
     return prefill, decode
 
 
-def validate_config(config):
-    if not config.get("ebb", {}).get("enabled", True):
-        raise ValueError("profile_ebb requires the EBB backend to be enabled")
+def validate_config(config, backend="ebb"):
+    label = "Bitlet" if backend == "bitlet" else "EBB"
+    if not config.get(backend, {}).get("enabled", True):
+        raise ValueError(f"profile_{backend} requires the {label} backend to be enabled")
     quant = config["quantization"]
     if quant.get("mixed_precision", False):
-        raise ValueError("EBB profiling requires mixed_precision=false")
+        raise ValueError(f"{label} profiling requires mixed_precision=false")
     if not quant.get("quantize_matmul", False):
-        raise ValueError("EBB profiling requires quantize_matmul=true")
+        raise ValueError(f"{label} profiling requires quantize_matmul=true")
     from quant.quant_spec import parse_quant_spec
     for name in LINEARS + ("qk_matmul", "pv_matmul"):
         layer = quant[name]
@@ -90,8 +111,12 @@ def validate_config(config):
             raise ValueError(f"{name}: expected E4M3 operands")
     if not quant.get("kv_cache", {}).get("fp8_static", False):
         raise ValueError("Set kv_cache.fp8_static=true for FP8 cache write semantics")
-    from quant.ebb import EBBConfig
-    EBBConfig.from_dict(config["ebb"])
+    if backend == "bitlet":
+        from quant.bitlet import BitletConfig
+        BitletConfig.from_dict(config["bitlet"])
+    else:
+        from quant.ebb import EBBConfig
+        EBBConfig.from_dict(config["ebb"])
 
 
 def bind_manager(model, manager):
@@ -138,13 +163,28 @@ def profile_tokens(args, config, tokenizer, prefill, decode):
     return ids[:needed]
 
 
-def main(argv=None):
-    args = parse_args(argv)
+def main(argv=None, *, backend="ebb"):
+    if backend not in ("ebb", "bitlet"):
+        raise ValueError("Unsupported profiling backend")
+    args = parse_args(argv, backend)
     config = deepcopy(load_config(args.config))
     if args.scale_dir is not None:
         config["quantization"]["scale_dir"] = str(args.scale_dir)
-    validate_config(config)
+    other_latency = None
+    if backend == "bitlet":
+        if args.exact and (args.prefill_sample_waves is not None or args.decode_sample_waves is not None):
+            raise ValueError("--exact cannot be combined with sample wave overrides")
+        for phase in ("prefill", "decode"):
+            value = 0 if args.exact else getattr(args, f"{phase}_sample_waves")
+            if value is not None:
+                config["bitlet"][f"{phase}_sample_waves"] = value
+        if args.other_latency_json:
+            other_latency = json.loads(args.other_latency_json.read_text())
+    validate_config(config, backend)
     prefill, decode = resolve_workload(config, args)
+    if other_latency is not None:
+        from quant.bitlet import validate_other_latency
+        validate_other_latency(other_latency, decode)
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable; select --device cpu for a small-model smoke run")
     installed = importlib.metadata.version("transformers")
@@ -167,7 +207,7 @@ def main(argv=None):
     model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=dtype,
                 device_map="auto" if args.device == "cuda" else None, attn_implementation="eager")
     if model.config.model_type != "qwen2":
-        raise ValueError("profile_ebb currently supports Qwen2/Qwen2.5")
+        raise ValueError(f"profile_{backend} currently supports Qwen2/Qwen2.5")
     quant = config["quantization"]
     if args.skip_calibration:
         quant["calibration_policy"] = dict(default="reuse")
@@ -197,8 +237,14 @@ def main(argv=None):
                 calibration_batches += 1
         calibration_manager.save_all_scales()
     switch_quantization_mode_all(model, "quant_forward")
-    ebb = dict(config["ebb"], trace_path=str(args.output_dir / "ebb_trace.jsonl"))
-    manager = QuantStatManager(scale_dir, ebb_config=ebb)
+    backend_config = dict(config[backend], trace_path=str(args.output_dir / f"{backend}_trace.jsonl"))
+    manager = QuantStatManager(scale_dir, **{f"{backend}_config": backend_config})
+    collector = getattr(manager, f"{backend}_stats")
+    def export_stats(workload):
+        path = args.output_dir / f"{backend}_summary.json"
+        if backend == "bitlet":
+            return manager.export_bitlet_stats(path, workload, other_latency)
+        return manager.export_ebb_stats(path, workload)
     bind_manager(model, manager)
     workload = dict(model_type=model.config.model_type, layers=len(model.model.layers),
                     d_model=model.config.hidden_size, ffn_dim=model.config.intermediate_size,
@@ -212,10 +258,10 @@ def main(argv=None):
                                      completed_batches=calibration_batches,
                                      operators_recalibrated=actions.count("recalibrate"),
                                      operators_reused=actions.count("reuse")),
-                    quantization=quant)
+                    quantization=quant, profile_backend=backend, source_commit=source_git_commit())
     workload.update(status="running", completed_decode_steps=0)
     (args.output_dir / "run_config.json").write_text(json.dumps(
-        dict(workload=workload, ebb=config["ebb"]), indent=2) + "\n")
+        dict(workload=workload, **{backend: config[backend]}), indent=2) + "\n")
     try:
         with torch.no_grad():
             manager.set_phase("prefill")
@@ -223,12 +269,14 @@ def main(argv=None):
             output = model.model(tokens[:prefill].unsqueeze(0).to(args.device),
                                  past_key_values=DynamicCache(), use_cache=True)
             past = output.past_key_values
-            if manager.ebb_stats.phases["prefill"]["calls"] != expected:
+            if collector.phases["prefill"]["calls"] != expected:
                 raise RuntimeError("Incomplete prefill operator coverage")
-            manager.export_ebb_stats(args.output_dir / "ebb_summary.json", workload)
+            if backend == "bitlet":
+                collector.validate_coverage(len(model.model.layers))
+            export_stats(workload)
             manager.set_phase("decode")
             from tqdm import trange
-            for step in trange(decode, desc="Collecting EBB decode"):
+            for step in trange(decode, desc=f"Collecting {backend.upper()} decode"):
                 if args.greedy_decode:
                     token = model.lm_head(output.last_hidden_state[:, -1]).argmax(-1).reshape(1, 1)
                 else:
@@ -240,24 +288,34 @@ def main(argv=None):
                     raise RuntimeError("KV cache did not grow by one token")
                 workload["completed_decode_steps"] = step + 1
                 if (step + 1) % args.checkpoint_every == 0:
-                    manager.export_ebb_stats(args.output_dir / "ebb_summary.json", workload)
-            if decode and manager.ebb_stats.phases["decode"]["calls"] != expected * decode:
+                    export_stats(workload)
+            if decode and collector.phases["decode"]["calls"] != expected * decode:
                 raise RuntimeError("Incomplete decode operator coverage")
+            if backend == "bitlet":
+                collector.validate_coverage(len(model.model.layers), decode)
             workload["status"] = "complete"
-            doc = manager.export_ebb_stats(args.output_dir / "ebb_summary.json", workload)
+            doc = export_stats(workload)
     except BaseException:
         workload["status"] = "interrupted"
-        manager.export_ebb_stats(args.output_dir / "ebb_summary.json", workload)
+        export_stats(workload)
         raise
     finally:
         manager.close()
     for phase, result in doc["phases"].items():
-        seconds = result["compute_seconds"]
-        print(f"{phase}: conditional compute bounds "
-              f"{seconds['ideal_balanced']:.6f}..{seconds['leading_zero']:.6f} s; "
-              f"word coverage complete={result['configured_word_coverage_complete']}")
+        if backend == "bitlet":
+            seconds = result["latency"]
+            print(f"{phase}: Bitlet GEMM/IO scenarios "
+                  f"{seconds['resident_full_overlap_seconds']:.6f}.."
+                  f"{seconds['streaming_no_overlap_seconds']:.6f} s; "
+                  f"sampled calls={result['sampled_calls']}; excludes unsupplied remaining operators")
+        else:
+            seconds = result["compute_seconds"]
+            print(f"{phase}: conditional compute bounds "
+                  f"{seconds['ideal_balanced']:.6f}..{seconds['leading_zero']:.6f} s; "
+                  f"word coverage complete={result['configured_word_coverage_complete']}")
     print(f"Results: {args.output_dir}")
 
 
 if __name__ == "__main__":
     main()
+

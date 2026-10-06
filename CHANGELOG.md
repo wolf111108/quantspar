@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-06 — Add paper-configured Bitlet profiling and latency scenarios
+
+- 目的：为 Qwen2.5-14B IA FP8 / Linear W INT4、2048 prefill＋256 decode 获取 Bitlet BCE 所需的实际列负载，并提供依据原论文硬件参数的独立 GEMM/搬运时延估计。
+- 内容：新增 Bitlet collector、Mapping_stat_bitlet、独立 YAML 和本地入口；默认使用原论文 32 PEs、N=64、1 GHz、24 mantissa lanes、两条各 12.8 GB/s DMA 及 25.6 GB/s local buffer 带宽，容量未报告保留 null。按产品指数 EA＋EB 对齐 B significand，包含 hidden one、符号控制、补码存储、截断和尾组诊断，不给 A 全零组加入论文未描述的 value-skip。支持 bounded chunk 的精确枚举或确定性 wave 抽样，利用精确 dense 基准估计节省量、导出误差与观察样本直方图。共享 runner 保留 EBB 默认路径；加入 GQA 物理 KV 流量、分算子 resident/full-overlap 与 streaming/no-overlap 情景、streamed trace、phase/layer/step 聚合、覆盖和 cache 增长检查、检查点及 Git commit provenance。未提供剩余成本时 E2E 字段为 null；新增离线入口将包含 LM head 的剩余算子成本补入完整采集结果，无需重跑模型；更新 README 和运行说明。
+- 验证：真实 PyTorch 2.6.0+cpu、Transformers 4.43.1 下 42 项测试通过（31 项原有回归＋11 项 Bitlet 检查），包括独立 Python 标量列/调度参考、hidden one、产品指数对齐/截断、补码与尾组、零 A 不绕过 B 工作、抽样复现/chunk 不变性/误差和 dense 尾组保护、双 DMA、GQA、导出隔离及剩余成本补全。保存并加载小型 Qwen，实际校准、推理和 teacher-forced/greedy subprocess CLI，确认九种算子覆盖与逐步 cache 增长。
+- 限制与旧结果影响：未运行完整 14B、CUDA、PPL 或 RTL。FP8×INT4 的 FP32 BCE 提升、同步 PE tile 调度、输出/cache 写通道、output_storage_bytes=2、group_setup_cycles=0 与 memory reuse 是显式分析假设；buffer 容量、控制停顿、partial-sum spill 和转换成本仍缺失，两种搬运情景不是物理保证上下界。项目未实现原生 W4 打包 kernel，硬件工作中的对齐截断不改变数值 forward。Bitlet 使用独立统计/schema/scale 目录，旧 Asyn-CIM/EBB 公式和倍率不变，不能直接导入 Bitlet；默认抽样直方图也不能当作全张量数量。256 decode 采用 256 次 forward 的工作量定义。
+
 ## 2026-10-06 — Support short EBB profiling and cap calibration length
 
 - 目的：允许内存有限的本地环境先收集 2048 prefill＋256 decode 的 EBB 数据，修复仅缩短 profiling 时仍按 8192 tokens 校准的隐藏内存开销。
@@ -36,3 +43,4 @@
 - 内容：加入 mapping、quant_linear、quant_matmul、stat_manager 和单样本脚本共 5 个文件。
 - 验证：本次按 Git 内容补录；不代表初始通路已通过完整执行验证。
 - 限制：该快照缺少导入模块，且数值/统计/映射存在上述后续修复的问题。
+
