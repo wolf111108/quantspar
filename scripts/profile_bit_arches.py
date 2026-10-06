@@ -1,9 +1,9 @@
-"""One calibration/inference pass collecting Bitlet and BitWave independently."""
+"""One calibration/inference pass collecting Bitlet, BitWave and Slim-Llama."""
 from .profile_ebb import main as _main
 
 
 def main(argv=None):
-    return _main(argv, backend="bitlet_bitwave")
+    return _main(argv, backend="bit_arches")
 
 
 if __name__ == "__main__":

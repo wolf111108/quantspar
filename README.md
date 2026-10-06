@@ -15,19 +15,20 @@ python -m scripts.profile_fp8_int4 --demo --output outputs/fp8_int4_demo.json
 - [FP8/INT4 修复与使用说明](docs/fp8_int4_path.md)
 - [EBB-CIM / MulTCIM 统计与本地运行](docs/ebb_cim.md)
 - [Bitlet 论文参数、2048＋256 采集与时延估计](docs/bitlet.md)
-- [一次推理同时统计 Bitlet / BitWave](docs/bitlet_bitwave.md)
+- [一次推理同时统计 Bitlet / BitWave / Slim-Llama](docs/bitlet_bitwave.md)
+- [Slim-Llama 聚类、S-LUT 与访存估计口径](docs/slimllama.md)
 - [每次提交的修改记录](CHANGELOG.md)
 - [提交维护规则](AGENTS.md)
 
-一次校准与推理同时获取 Bitlet、BitWave 的独立统计：
+一次校准与推理同时获取 Bitlet、BitWave、Slim-Llama 的独立统计：
 
 ~~~bash
 python -m scripts.profile_bit_arches \
   --model-path /path/to/Qwen2.5-14B \
-  --output-dir outputs/bitlet_bitwave_2048_256
+  --output-dir outputs/bit_arches_2048_256
 ~~~
 
-默认保持 2048＋256、IA FP8 / W INT4，共用 Bitlet 的量化和 scale 设置；分别输出两份 summary/trace 和 bit_arch_comparison.json。BitWave 采用原论文的整数位列规则与显式 FP8 分片分析扩展；论文未给 DRAM 速率，可用 --bitwave-dram-bandwidth-gbps 指定搬运假设。原 Bitlet 单独入口仍可使用。
+默认保持 2048＋256、IA FP8 / W INT4，共用原量化和 scale 设置；分别输出三份 summary/trace 和 bit_arch_comparison.json。Slim-Llama 默认 64 SBC、200 MHz、500 KB SRAM、1.6 GB/s 外部带宽，以实际权重中心和无损差量建模输出复用；FP8 分片、聚类算法及调度是显式分析假设。BitWave 论文未给 DRAM 速率，可用 --bitwave-dram-bandwidth-gbps 指定搬运假设。--architectures bitlet bitwave 可只运行两者；原双后端 YAML 仍只启用其两个 collector，三种架构也保留单独入口。
 
 Bitlet 默认使用原论文 32 PEs、64 元素组、1 GHz、两条各 12.8 GB/s DMA 和 25.6 GB/s local buffer 带宽；容量未报告，保持 null。安装全模型依赖后可直接运行：
 

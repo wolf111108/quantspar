@@ -1,6 +1,6 @@
 # Bitlet：Qwen2.5-14B FP8 / INT4 的统计与时延估计
 
-需要一次推理同时收集 Bitlet 和 BitWave 时，使用 [双后端入口](bitlet_bitwave.md)。本页中的单独 Bitlet 命令与默认映射保留。
+需要一次推理同时收集 Bitlet、BitWave 和 Slim-Llama 时，使用 [联合入口](bitlet_bitwave.md)。本页中的单独 Bitlet 命令与默认映射保留。
 
 入口为 scripts.profile_bitlet，默认收集 batch=1、2048 prefill＋256 decode 的实际量化操作数。Linear 使用 IA FP8 E4M3FN、W INT4；QK/PV 两侧均为 FP8，K/V 在写 cache 前量化。关闭 outlier 和混精，使用独立的校准 scale 目录。
 

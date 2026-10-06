@@ -40,9 +40,11 @@ def transformers_version_tuple(raw):
 
 
 def requested_architectures(backend):
+    if backend == "bit_arches":
+        return ("bitlet", "bitwave", "slimllama")
     if backend == "bitlet_bitwave":
         return ("bitlet", "bitwave")
-    if backend in ("ebb", "bitlet", "bitwave"):
+    if backend in ("ebb", "bitlet", "bitwave", "slimllama"):
         return (backend,)
     raise ValueError("Unsupported profiling backend")
 
@@ -50,9 +52,11 @@ def requested_architectures(backend):
 def parse_args(argv=None, backend="ebb"):
     architectures = requested_architectures(backend)
     parser = argparse.ArgumentParser(description=(
-        "One Qwen FP8/W4 inference pass with separate Bitlet/BitWave collectors."
-        if backend == "bitlet_bitwave" else f"Local Qwen FP8/W4 {backend} collection."))
-    default_config = ("config/qwen2_14b_bitlet_bitwave_f8i4_2048_256.yaml"
+        "One Qwen FP8/W4 inference pass with separate architecture collectors."
+        if len(architectures) > 1 else f"Local Qwen FP8/W4 {backend} collection."))
+    default_config = ("config/qwen2_14b_bit_arches_f8i4_2048_256.yaml"
+                      if "slimllama" in architectures else
+                      "config/qwen2_14b_bitlet_bitwave_f8i4_2048_256.yaml"
                       if "bitwave" in architectures else
                       "config/qwen2_14b_bitlet_f8i4_2048_256.yaml" if backend == "bitlet"
                       else "config/qwen2_14b_ebb_f8i4.yaml")
@@ -72,6 +76,9 @@ def parse_args(argv=None, backend="ebb"):
                         help="torch.save LongTensor [tokens], or dict with input_ids; no dataset needed")
     parser.add_argument("--greedy-decode", action="store_true",
                         help="generate tokens; default uses teacher-forced tokens from the document")
+    if backend == "bit_arches":
+        parser.add_argument("--architectures", nargs="+", choices=("bitlet", "bitwave", "slimllama"),
+                            help="Default: enabled collectors in YAML (all three in default YAML); select a subset")
     if backend != "ebb":
         parser.add_argument("--exact", action="store_true", help="Enumerate all tiles in every requested collector")
         parser.add_argument("--prefill-sample-waves", type=int,
@@ -84,6 +91,13 @@ def parse_args(argv=None, backend="ebb"):
         parser.add_argument("--bitwave-dram-bandwidth-gbps", type=float,
                             help="Explicit DRAM bandwidth assumption, decimal GB/s; paper does not specify it")
         parser.add_argument("--bitwave-dataflow", choices=("auto", "SU1", "SU2", "SU3", "SU4", "SU5", "SU6"))
+    if "slimllama" in architectures:
+        parser.add_argument("--slimllama-weight-clusters", type=int,
+                            help="Prototype count; paper benchmark uses 128")
+        parser.add_argument("--slimllama-dram-bandwidth-gbps", type=float,
+                            help="Override decimal GB/s; default 1.6 at 200 MHz from Fig.23.9.7")
+        parser.add_argument("--slimllama-sram-bandwidth-gbps", type=float,
+                            help="Explicit internal SRAM bandwidth assumption; not published in digest")
     return parser.parse_args(argv)
 
 
@@ -107,11 +121,13 @@ def resolve_workload(config, args):
 
 
 def validate_config(config, backend="ebb"):
-    if backend == "bitlet_bitwave":
+    if len(requested_architectures(backend)) > 1:
         for name in requested_architectures(backend):
             validate_config(config, name)
         return
     label = backend.capitalize()
+    if backend not in config:
+        raise ValueError(f"Missing {backend} section in profiling YAML")
     if not config.get(backend, {}).get("enabled", True):
         raise ValueError(f"profile_{backend} requires the {label} backend to be enabled")
     quant = config["quantization"]
@@ -131,7 +147,12 @@ def validate_config(config, backend="ebb"):
             raise ValueError(f"{name}: expected E4M3 operands")
     if not quant.get("kv_cache", {}).get("fp8_static", False):
         raise ValueError("Set kv_cache.fp8_static=true for FP8 cache write semantics")
-    if backend == "bitlet":
+    if backend == "slimllama":
+        if quant.get("weight_scale_granularity", "scalar") != "scalar":
+            raise ValueError("Slim-Llama output reuse requires a shared scalar weight scale")
+        from quant.slimllama import SlimLlamaConfig
+        SlimLlamaConfig.from_dict(config["slimllama"])
+    elif backend == "bitlet":
         from quant.bitlet import BitletConfig
         BitletConfig.from_dict(config["bitlet"])
     elif backend == "bitwave":
@@ -187,9 +208,20 @@ def profile_tokens(args, config, tokenizer, prefill, decode):
 
 
 def main(argv=None, *, backend="ebb"):
-    architectures = requested_architectures(backend)
     args = parse_args(argv, backend)
     config = deepcopy(load_config(args.config))
+    if backend == "bit_arches":
+        architectures = tuple(args.architectures or [name for name in requested_architectures(backend)
+                             if name in config and config[name].get("enabled", True)])
+    else:
+        architectures = requested_architectures(backend)
+    if not architectures:
+        raise ValueError("Enable at least one requested architecture in profiling YAML")
+    if len(architectures) != len(set(architectures)):
+        raise ValueError("--architectures must not contain duplicates")
+    for name in architectures:
+        if name not in config:
+            raise ValueError(f"Missing {name} section in profiling YAML")
     if args.scale_dir is not None:
         config["quantization"]["scale_dir"] = str(args.scale_dir)
     other_latency = None
@@ -206,9 +238,18 @@ def main(argv=None, *, backend="ebb"):
                 config["bitwave"]["dram_bytes_per_second"] = args.bitwave_dram_bandwidth_gbps*1e9
             if args.bitwave_dataflow is not None:
                 config["bitwave"]["dataflow"] = args.bitwave_dataflow
+        if "slimllama" in architectures:
+            for option, key, multiplier in (
+                ("slimllama_weight_clusters", "weight_clusters", 1),
+                ("slimllama_dram_bandwidth_gbps", "dram_bytes_per_second", 1e9),
+                ("slimllama_sram_bandwidth_gbps", "sram_bytes_per_second", 1e9)):
+                value = getattr(args, option)
+                if value is not None:
+                    config["slimllama"][key] = value*multiplier
         if args.other_latency_json:
             other_latency = json.loads(args.other_latency_json.read_text())
-    validate_config(config, backend)
+    for name in architectures:
+        validate_config(config, name)
     prefill, decode = resolve_workload(config, args)
     if other_latency is not None:
         from quant.bitlet import validate_other_latency
@@ -361,6 +402,12 @@ def main(argv=None, *, backend="ebb"):
                 print(f"{phase}: BitWave conditional slice compute "
                       f"{seconds['mapped_compute_seconds']:.6f} s; sampled calls={result['sampled_calls']}; "
                       f"DRAM bandwidth supplied={document['latency']['dram_bandwidth_supplied']}")
+            elif name == "slimllama":
+                seconds = result["latency"]
+                print(f"{phase}: Slim-Llama conditional S-LUT/DRAM scenarios "
+                      f"{seconds['minimum_traffic_full_overlap_seconds']:.6f}.."
+                      f"{seconds['capacity_window_no_overlap_seconds']:.6f} s; "
+                      f"sampled calls={result['sampled_calls']}; excludes unmodeled control/conversion costs")
             else:
                 seconds = result["compute_seconds"]
                 print(f"{phase}: conditional compute bounds "

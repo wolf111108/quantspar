@@ -142,7 +142,7 @@ class QuantStatManager:
     def __init__(self, scale_dir: str, nmacro: int = 32, as_l: int = 1, *,
                  h: int = 64, w: int = 48, banks: int = 16,
                  bit_scope: str = "mantissa", cycles_per_effective_bit: float = 1,
-                 ebb_config=None, bitlet_config=None, bitwave_config=None):
+                 ebb_config=None, bitlet_config=None, bitwave_config=None, slimllama_config=None):
         """
         Initialize statistics manager.
 
@@ -165,12 +165,13 @@ class QuantStatManager:
         self.ebb_stats = None
         self.bitlet_stats = None
         self.bitwave_stats = None
+        self.slimllama_stats = None
         self.execution_context = {}
         self.attention_context = {}
         if (ebb_config is not None and ebb_config.get("enabled", True) and any(
                 value is not None and value.get("enabled", True)
-                for value in (bitlet_config, bitwave_config))):
-            raise ValueError("EBB collection is separate from Bitlet/BitWave collection")
+                for value in (bitlet_config, bitwave_config, slimllama_config))):
+            raise ValueError("EBB collection is separate from Bitlet/BitWave/Slim-Llama collection")
         if ebb_config is not None and ebb_config.get("enabled", True):
             from .ebb import EBBConfig, EBBStats
             self.ebb_stats = EBBStats(EBBConfig.from_dict(ebb_config), ebb_config.get("trace_path"))
@@ -182,9 +183,14 @@ class QuantStatManager:
             from .bitwave import BitWaveConfig, BitWaveStats
             self.bitwave_stats = BitWaveStats(BitWaveConfig.from_dict(bitwave_config),
                                               bitwave_config.get("trace_path"))
+        if slimllama_config is not None and slimllama_config.get("enabled", True):
+            from .slimllama import SlimLlamaConfig, SlimLlamaStats
+            self.slimllama_stats = SlimLlamaStats(SlimLlamaConfig.from_dict(slimllama_config),
+                                                slimllama_config.get("trace_path"))
         self.bit_architecture_collectors = {
             name: collector for name, collector in (
-                ("bitlet", self.bitlet_stats), ("bitwave", self.bitwave_stats))
+                ("bitlet", self.bitlet_stats), ("bitwave", self.bitwave_stats),
+                ("slimllama", self.slimllama_stats))
             if collector is not None
         }
         self._static_weights_seen = set()
@@ -392,6 +398,11 @@ class QuantStatManager:
             raise ValueError("BitWave backend is not enabled")
         return self.bitwave_stats.export(path, workload, other_latency)
 
+    def export_slimllama_stats(self, path, workload=None, other_latency=None):
+        if self.slimllama_stats is None:
+            raise ValueError("Slim-Llama backend is not enabled")
+        return self.slimllama_stats.export(path, workload, other_latency)
+
     def close(self):
         if self.ebb_stats is not None:
             self.ebb_stats.close()
@@ -399,6 +410,8 @@ class QuantStatManager:
             self.bitlet_stats.close()
         if self.bitwave_stats is not None:
             self.bitwave_stats.close()
+        if self.slimllama_stats is not None:
+            self.slimllama_stats.close()
 
     def reset_sparsity(self):  #add
         if self.ebb_stats is not None or self.bit_architecture_collectors:

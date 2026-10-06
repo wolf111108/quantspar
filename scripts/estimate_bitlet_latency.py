@@ -1,4 +1,4 @@
-"""Add remaining latencies to a Bitlet/BitWave summary without rerunning Qwen."""
+"""Add remaining latencies to a Bitlet/BitWave/Slim-Llama summary without rerunning Qwen."""
 import argparse
 import json
 from pathlib import Path
@@ -7,8 +7,8 @@ from quant.bitlet import validate_other_latency
 
 
 def estimate(summary, other):
-    if summary.get("backend") not in ("bitlet", "bitwave") or summary.get("schema_version") != 1:
-        raise ValueError("Input must be a Bitlet/BitWave schema_version=1 summary")
+    if summary.get("backend") not in ("bitlet", "bitwave", "slimllama") or summary.get("schema_version") != 1:
+        raise ValueError("Input must be a Bitlet/BitWave/Slim-Llama schema_version=1 summary")
     workload = summary["workload"]
     if workload.get("status") != "complete" or not summary["latency"]["collection_complete"]:
         raise ValueError("Complete profiling is required before adding E2E costs")

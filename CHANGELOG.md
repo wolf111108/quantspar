@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-06 — Add Slim-Llama to joint architecture profiling
+
+- 目的：在同一次 Qwen2.5-14B IA FP8 / Linear W INT4、2048＋256 实验中增加 Slim-Llama，使 Bitlet、BitWave 和 Slim-Llama 共用实际量化操作数、校准与推理。
+- 内容：新增 SlimLlamaConfig/Stats、Mapping_stat_slimllama、独立 trace/summary、单独入口、三后端 YAML 和说明；联合入口默认启用三个 collector，支持 --architectures 子集和旧双后端 YAML。默认硬件依据 ISSCC 2025 Fig.23.9.2/3/4/7：8×8 SBC、每 SBC 八列/每列八 S-LUT、200 MHz、500 KB（明确按 512000 bytes 解释）、1.6 GB/s 外部带宽。每层用可复现的实际权重 prototype 与 feature-Hamming assignment 聚类一次，保留完整 INT4 差量并以 INT5 验证；统计 center/mixed residual/buffer residual 周期、真实 tile 零比例、位宽与 activation passes，计中心 store/reuse。FP8 数值无损定点对齐，宽 A 拆成 signed INT4 digits，B 分 magnitude planes，每 plane 同步；Mixed 用四 LUT/four buffer registers 对应七 K 位置，Buffer 用八位置/two nonzero reads。QK/PV 不进行静态聚类，GQA 保留物理 KV 搬运；SRAM 检查扩展 tile、中心输出和 partial-sum 行窗口，容量情景计原始 W4、中心系数、IDs 及重读 A，无免费片外压缩。剩余成本离线入口增加 Slim-Llama，旧 schema 保留；更新 README 与使用文档。
+- 验证：真实 PyTorch 2.6.0+cpu、Transformers 4.43.1 下全套 59 项测试通过（49 项既有＋10 项 Slim-Llama）；之后补充 half 输入 INT16 差量溢出保护用例，10 项 Slim-Llama 再次通过。独立纯 Python 参考覆盖 Mixed/Buffer、逐 plane barrier、INT4/FP8、宽 K/V、M/N/K 尾组和 center/delta/reuse；检查差量 ±15、无损 FP8、INT4 -8、零 A 不跳过、配置拒绝、抽样与 chunk 不变性、容量拒绝、中心/ID 流量、一次聚类与变化 probe。真实保存/加载小型 Qwen：一次校准＋一次 prefill＋两次 decode 共四次 forward，每个后端 9＋18 调用；三者单独/共同统计相同、teacher-forced/greedy CLI、GQA/cache、E2E 补成本、选择两后端和失败后全部 trace 关闭通过；旧双后端、Bitlet、BitWave、EBB、Asyn 回归通过，CLI help、语法与 diff 检查通过。
+- 限制与旧结果影响：未运行完整 14B、CUDA、PPL 或 RTL。论文未完整公开聚类算法、INT4/FP8 控制、LUT 初始化与切换周期、SRAM/NoC 带宽；feature 聚类、signed-INT4 分片、Mixed/full-buffer 切换、中心复用吞吐及 SRAM 窗口是显式分析选择。默认 setup=0 是占位，内部带宽 null 表示未计入；两种情景不能保证物理上下界，完整 E2E 仍需剩余算子及转换/控制成本。静态量化权重假定不变，64 元素 probe 不能检测所有修改；--exact 仅精确枚举当前映射周期，未优化全 K 聚类。host 预处理时间不计推理时延；index reordering 不给予免费周期/能耗收益。新默认 joint 入口增加统计时间/文件大小和 profile_backend 元数据，原量化与 scale 路径不变，Bitlet/BitWave/EBB/Asyn 周期及流量公式未改；相同旧 YAML 仍只运行原两个 collector，旧结果不会自动获得 Slim-Llama 数据。
+
 ## 2026-10-06 — Add joint Bitlet and BitWave profiling
 
 - 目的：让同一次 Qwen2.5-14B IA FP8 / Linear W INT4、2048＋256 实验同时采集 Bitlet 与 BitWave 的独立数据，避免重复校准和数值推理。

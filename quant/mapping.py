@@ -1,5 +1,12 @@
 from dataclasses import dataclass
 
+def Mapping_stat_slimllama(activation, weight, a_spec, b_spec, in_features,
+                          out_features, config, phase="prefill", seed=None, weight_plan=None):
+    """Slim-Llama S-LUT work and exact static center/delta decomposition."""
+    from .slimllama import measure_slimllama_mapping
+    return measure_slimllama_mapping(activation, weight, a_spec, b_spec, in_features,
+                                    out_features, config, phase, seed, weight_plan)
+
 def Mapping_stat_bitwave(activation, weight, a_spec, b_spec, in_features,
                          out_features, config, phase="prefill", seed=None):
     """BitWave nonzero B columns with Table-I spatial unrolling."""

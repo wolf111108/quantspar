@@ -1,11 +1,11 @@
-# 一次 Qwen 推理同时收集 Bitlet 与 BitWave
+# 一次 Qwen 推理同时收集 Bitlet、BitWave 与 Slim-Llama
 
-scripts.profile_bit_arches 共用一次模型加载、一次校准和一条 prefill/decode 输入序列，将每次实际量化得到的 A/B 张量交给两个独立 collector。默认 batch=1、2048 prefill＋256 次 decode forward，IA FP8 E4M3FN、Linear W INT4、FP8 KV；与 Bitlet 单独入口使用相同量化配置和 scale 目录。
+scripts.profile_bit_arches 共用一次模型加载、一次校准和一条 prefill/decode 输入序列，将每次实际量化得到的 A/B 张量交给三个独立 collector。默认配置为 config/qwen2_14b_bit_arches_f8i4_2048_256.yaml：batch=1、2048 prefill＋256 次 decode forward，IA FP8 E4M3FN、Linear W INT4、FP8 KV；与此前两个后端使用相同量化配置和 scale 目录。Slim-Llama 的完整口径见 [说明](slimllama.md)。
 
 ~~~bash
 python -m scripts.profile_bit_arches \
   --model-path /path/to/Qwen2.5-14B \
-  --output-dir outputs/bitlet_bitwave_2048_256
+  --output-dir outputs/bit_arches_2048_256
 ~~~
 
 依赖仍为 requirements-model.txt。已生成并确认匹配的 Bitlet scales 可加 --skip-calibration 复用。首次校准需要 YAML 中的文本数据集；--token-file 只替代 profiling 输入。可先用独立 smoke scales 检查本地环境：
@@ -24,18 +24,19 @@ python -m scripts.profile_bit_arches \
 
 | 文件 | 内容 |
 |---|---|
-| run_config.json | 共同 workload、校准/复用信息和两套硬件参数 |
+| run_config.json | 共同 workload、校准/复用信息和所选硬件参数 |
 | bitlet_summary.json / bitlet_trace.jsonl | Bitlet 相位/层/步汇总和逐算子记录 |
 | bitwave_summary.json / bitwave_trace.jsonl | BitWave 相位/层/步汇总和逐算子记录 |
+| slimllama_summary.json / slimllama_trace.jsonl | Slim-Llama 聚类/差量、S-LUT、容量窗口和相位/层/步汇总 |
 | bit_arch_comparison.json | 相同输入的调用数、各自计算加速比与时延情景 |
 
-48 层完整实验中，每个 collector 都应收集 432 个 prefill 调用和 110592 个 decode 调用。runner 逐 collector 检查所有 layer/operator 的覆盖和共同 cache 增长；默认每 32 步更新汇总。中断或某个 collector 失败时，两份结果标为 interrupted，关闭两个 trace，不能用于完整 E2E。
+48 层完整实验中，每个 collector 都应收集 432 个 prefill 调用和 110592 个 decode 调用。runner 逐 collector 检查所有 layer/operator 的覆盖和共同 cache 增长；默认每 32 步更新汇总。中断或某个 collector 失败时，全部所选结果标为 interrupted，关闭所有 trace，不能用于完整 E2E。
 
-额外 collector 会增加统计耗时和 trace 磁盘占用，但不会重复校准或重复数值推理。默认保持可复现抽样；--prefill-sample-waves / --decode-sample-waves 同时设置两者的预算，BitWave 的预算应用于每个候选 SU 的独立操作数。--exact 同时全量枚举两者，14B 下可能很慢。
+额外 collector 会增加统计耗时和 trace 磁盘占用，但不会重复校准或重复数值推理。Slim-Llama 在首次遇到某层 Linear 时聚类一次，后续复用 assignment。默认保持可复现抽样；--prefill-sample-waves / --decode-sample-waves 同时设置所选 collector 的预算，BitWave 每个候选 SU、Slim-Llama 每个 center/residual/reference stage 分别使用预算。--exact 全量枚举周期统计，14B 下可能很慢；它不将 feature 聚类替换为全 K 的最优聚类。
 
-comparison 中的 compute 加速比使用各自的 dense 布局作基准。比较两种架构的总性能时应使用前提一致的总时延；这些计算比率只反映各自跳过工作量的收益。
+comparison 中的 compute 加速比使用各自的 dense 布局作基准。比较架构的总性能时应使用前提一致的总时延；这些计算比率只反映各自跳过工作量的收益。Slim-Llama 聚类/复用开销可使其倍率小于 1，程序不会裁剪成正向收益。
 
-也可分别运行 scripts.profile_bitlet 或 scripts.profile_bitwave；其 quantization、seed、step 和配置一致时，单独运行与共同运行的统计一致。Bitlet 既有默认入口和映射公式保持不变，EBB 仍走独立入口。
+也可分别运行 scripts.profile_bitlet、scripts.profile_bitwave 或 scripts.profile_slimllama；其 quantization、seed、step 和配置一致时，单独运行与共同运行的统计一致。--architectures bitlet bitwave 保留双后端实验；显式使用旧双后端 YAML 时默认仍只运行其启用的两个后端。Bitlet 既有默认入口和映射公式保持不变，EBB 仍走独立入口。
 
 ## BitWave 的论文默认参数
 
@@ -99,6 +100,6 @@ python -m scripts.profile_bit_arches \
 
 这里的 12.8 是使用者指定的比较条件，不是 BitWave 论文参数；GB/s 为十进制，不会改变 Bitlet 的两条独立 DMA 默认值。BitWave 按 Eq.5 的结构逐 GEMM 加 DRAM 与 output writes，再取 compute 和 SRAM input reads 的 max；另外给 streaming 无重叠情景。未模拟全部 register traffic、重排、spill 或控制，不能作为真实物理上下界。
 
---other-latency-json 可同时补两者的 LM head 和其他算子耗时；缺这些成本时 E2E 保持 null。采集后 scripts.estimate_bitlet_latency 也接受 BitWave summary（需已填 DRAM 速率），schema 与操作见 [Bitlet 说明](bitlet.md)。FP8 转换和分片累加成本需明确包含在剩余耗时中；不能把统计脚本的 GPU 墙钟时间作为 Bitlet/BitWave 时延。
+--other-latency-json 可同时补所选架构的 LM head 和其他算子耗时；缺这些成本时 E2E 保持 null。共用该文件表示沿用同一组剩余算子假设；各架构额外的格式/控制成本不同，应分别用离线补成本入口合并后重新估计。scripts.estimate_bitlet_latency 接受 Bitlet、BitWave（需已填 DRAM 速率）和 Slim-Llama summary，schema 与操作见 [Bitlet 说明](bitlet.md)。FP8 转换和分片累加成本需明确包含在剩余耗时中；不能把统计脚本的 GPU 墙钟时间作为硬件时延。
 
 本次仅在真实 CPU PyTorch/Transformers、小型 Qwen 上检查数值操作数共享、单次校准/推理、独立参考调度、单独/共同结果相同、两种 decode、cache、流式输出与失败关闭；完整 14B、CUDA、PPL 与 RTL 由本地实验补充。
