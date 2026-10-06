@@ -2,121 +2,21 @@ from dataclasses import dataclass
 from re import M, X
 from typing import Any, Optional, Tuple
 
-from networkx import k_crust
 import torch
 import torch.nn.functional as F
 import math  
 
 
-def _to_fp8_e4m3_bits(
-    tensor: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """将 FP tensor 转换为 E4M3 FP8 格式，返回每行 exp 差值、sign+mantissa 矩阵和完整 8-bit 模式。
+def _to_fp8_e4m3_bits(tensor):
+    """Native E4M3FN encoding including ties, subnormal carry and raw bits."""
+    raw=tensor.float().clamp(-448,448).to(torch.float8_e4m3fn).contiguous().view(torch.uint8)
+    exp=((raw.long()>>3)&15).float()
+    nonzero=tensor!=0
+    hi=torch.where(nonzero,exp,torch.full_like(exp,-float("inf"))).amax(-1)
+    lo=torch.where(nonzero,exp,torch.full_like(exp,float("inf"))).amin(-1)
+    span=torch.where(nonzero.any(-1),hi-lo,torch.zeros_like(hi))
+    return span,raw&7,raw
 
-    FP8 E4M3FN 格式 (1 sign + 4 exponent + 3 mantissa):
-    - E=0,   D=0~7  : subnormal,  value = (D/8) × 2^(-6)
-    - E=1~14, D=0~7 : normal,     value = (1 + D/8) × 2^(E-7)
-    - E=15,  D=0~6  : normal,     value = (1 + D/8) × 2^8
-    - E=15,  D=7    : NaN
-    - 最大有限值 = (1 + 6/8) × 2^8 = 448
-    - 溢出时映射到 NaN (E=15, M=7, 与 PyTorch 行为一致)
-
-    Returns:
-        exp_range_per_row: shape [rows], 每行中非零元素最大 exp 与最小 exp 之差
-        sign_mantissa: shape 同 tensor, 每个元素低 3 位 = {mantissa(3bit)} (0MMM)
-        fp8_bits: shape 同 tensor, 完整 8-bit FP8 bit pattern (uint8)
-    """
-    sign = tensor < 0
-    abs_x = tensor.abs()
-    zero_mask = abs_x == 0
-
-    # frexp is not implemented for BFloat16 on CUDA; cast to float32 first
-    if abs_x.dtype == torch.bfloat16:
-        abs_x_f32 = abs_x.to(torch.float32)
-    else:
-        abs_x_f32 = abs_x
-
-    mant, exp = torch.frexp(abs_x_f32)  # mant ∈ [0.5, 1.0), exp 真实无偏指数
-    exp_unbiased = exp - 1               # 使 mant ∈ [1.0, 2.0)
-    bias = 7
-    exp_field = (exp_unbiased + bias).to(torch.float32)  # FP8 biased exponent
-
-    frac = mant * 2.0 - 1.0             # mantissa fraction ∈ [0.0, 1.0)
-    mantissa = torch.round(frac * 8.0)  # 量化到 3-bit mantissa
-
-    # 处理进位: mantissa=8 → carry, exp_field+1, mantissa=0
-    carry = mantissa == 8.0
-    exp_field = exp_field + carry.to(exp_field.dtype)
-    mantissa = torch.where(carry, torch.zeros_like(mantissa), mantissa)
-
-    # ---- 溢出: exp_field > 15 → E=15, M=7 (NaN, 与 PyTorch 行为一致) ----
-    overflow = exp_field > 15.0
-    exp_field = exp_field.clamp(max=15.0)
-    mantissa = torch.where(overflow, torch.full_like(mantissa, 7.0), mantissa)
-
-    # ---- E=15 且非溢出时, mantissa 必须 ≤ 6 (D=7 为 NaN, 仅溢出时使用) ----
-    mantissa = torch.where(
-        (exp_field == 15.0) & ~overflow,
-        mantissa.clamp(max=6.0),
-        mantissa,
-    )
-
-    del mant, exp, frac, carry, overflow  # 释放中间变量
-
-    # ---- Subnormal: exp_field < 1 ----
-    subnormal = exp_field < 1.0
-
-    # Subnormal mantissa: value = D/8 × 2^(-6), 所以 D = round(abs_x / 2^(-9))
-    # (因为 D/8 × 2^(-6) = D × 2^(-9))
-    sub_mantissa = torch.round(abs_x_f32 / (2.0 ** (-9))).clamp(min=0.0, max=7.0)
-
-    # 当 subnormal mantissa 进位到 8 时, 升格为 E=1, M=0
-    sub_carry = sub_mantissa == 8.0
-    subnormal = subnormal & ~sub_carry  # 进位后不再是 subnormal
-    sub_mantissa = torch.where(sub_carry, torch.zeros_like(sub_mantissa), sub_mantissa)
-    exp_field = torch.where(sub_carry, torch.ones_like(exp_field), exp_field)
-
-    # 应用 subnormal
-    exp_field = torch.where(subnormal, torch.zeros_like(exp_field), exp_field)
-    mantissa = torch.where(subnormal, sub_mantissa, mantissa)
-
-    mantissa = mantissa.clamp(min=0.0, max=7.0)
-
-    # ---- 构造输出 ----
-    exp_field_u8 = exp_field.to(torch.uint8)      # E: 0~15
-    mantissa_u8 = mantissa.to(torch.uint8)         # M: 0~7
-    sign_u8 = sign.to(torch.uint8)                 # S: 0 or 1
-
-    # 零值处理: E=0, M=0, S=0
-    exp_field_u8 = torch.where(zero_mask, torch.zeros_like(exp_field_u8), exp_field_u8)
-    mantissa_u8 = torch.where(zero_mask, torch.zeros_like(mantissa_u8), mantissa_u8)
-    sign_u8 = torch.where(zero_mask, torch.zeros_like(sign_u8), sign_u8)
-
-    # (1) exp_range_per_row: 每行非零元素 max_exp - min_exp
-    #    零值 exp 不参与 max/min, 用特殊值替代
-    exp_for_max = exp_field.clone()
-    exp_for_max[zero_mask] = -1.0             # max 时零值不影响
-    exp_for_min = exp_field.clone()
-    exp_for_min[zero_mask] = float('inf')     # min 时零值不影响
-
-    row_max_exp = exp_for_max.max(dim=-1).values
-    row_min_exp = exp_for_min.min(dim=-1).values
-
-    # 如果一行全是零, min 会是 inf, max 会是 -1; 此时 exp_range = 0
-    all_zero_row = row_min_exp == float('inf')
-    row_min_exp = torch.where(all_zero_row, torch.zeros_like(row_min_exp), row_min_exp)
-    row_max_exp = torch.where(all_zero_row, torch.zeros_like(row_max_exp), row_max_exp)
-
-    exp_range_per_row = (row_max_exp - row_min_exp)  # shape [rows]
-
-    # (2) mantissa only: 每元素仅保留 mantissa(3bit) → 3-bit uint8
-    sign_mantissa = mantissa_u8     # 0b0MMM
-
-    # (3) aligned_fp8_bits: 将 sign_mantissa 左移 exp 后得到的值
-    #     由于 exp 取值 0~15，最大位宽理论上为 4 + 15 = 19
-    #aligned_fp8_bits = (sign_mantissa.long() << exp_field_u8.long())
-
-    return exp_range_per_row, sign_mantissa, 0
 
 
 def _to_int8_bits(
@@ -383,7 +283,7 @@ def padding_x(
                                0, 0))     # Nbatch dim=0: 不 pad
 
     # reshape: 使用 h_eff 而非硬编码 h 或 in_features==128 hack
-    x_div = x_pad.reshape(Nbatch, Nhead, Mr, Kr, M, K, Nadder, h_eff)
+    x_div = x_pad.reshape(Nbatch, Nhead, Mr, M, Kr, K, Nadder, h_eff).permute(0, 1, 2, 4, 3, 5, 6, 7)
 
     return x_div
 
@@ -893,479 +793,67 @@ def compute_optimal_macro_layout_decode(
     )
 
 
-def Mapping_stat_dynamic(
-        CIM: CIM_sys,
-        sm_codes: torch.Tensor,
-        sm_widths: torch.Tensor,
-        exp_codes: torch.Tensor,
-        in_features: int,
-        out_features: int,
-        attn: bool = True,
-        n_heads: int = 28,
-        mp_high_ratio: float = 0.1,
-        mp_low_ratio: float = 0.65,
-        ):
-    """Map token-dependent FP precision onto the EffLoc prefill datapath.
+def Mapping_stat_dynamic(CIM, sm_codes, sm_widths, exp_codes, in_features,
+                         out_features, attn=True, n_heads=28,
+                         mp_high_ratio=0.1, mp_low_ratio=0.65,
+                         is_prefill=True, as_l=1):
+    """Map actual per-token mantissa widths; nominal ratios do not set baseline.
 
-    n_heads: attn=True 时用于 (num_heads*S, D) -> (1, num_heads, S, D) 的
-    reshape。不同模型 head 数不同 (Qwen2.5-7B=28, 14B=40, OPT=32)，
-    由调用方按实际张量形状传入; 默认 28 保持向后兼容。
-
-    The returned latency values are effective-bit steps. Physical time is
-    obtained by multiplying these steps by ``cycles_per_effective_bit``
-    (three clocks in the target hardware) exactly once in
-    ``_cycles_to_seconds``.
-
-    sm_codes use the 0MMM convention: mantissa bits only, no sign bit.
-    sm_widths is the number of mantissa bits per element (3 for FP8,
-    7 for BF16, 10 for FP16, 1 for FP4).
+    Exponent costs are excluded. Independent batch/head operands serialize.
+    Both dense and sparse execute the same padded bank/macro aggregation.
     """
-    if True:    
-
-        if sm_codes.dim() == 3:
-            # (B, S, D) -> (B, 1, S, D)
-            sm_codes_pad = sm_codes.unsqueeze(0)
-            sm_widths_pad = sm_widths.unsqueeze(0)
-            exp_codes_pad = exp_codes.unsqueeze(0)
-        elif sm_codes.dim() == 2:
-            if attn:
-                # (num_heads*S, D) -> (1, n_heads, S, D)
-                if n_heads <= 0 or sm_codes.shape[0] % n_heads != 0:
-                    raise ValueError(
-                        f"attn reshape 失败: rows={sm_codes.shape[0]} 不能被 "
-                        f"n_heads={n_heads} 整除。请传入正确的 head 数。"
-                    )
-                sm_codes_pad = sm_codes.reshape(1, n_heads, sm_codes.shape[0]//n_heads, sm_codes.shape[1])
-                sm_widths_pad = sm_widths.reshape(1, n_heads, sm_codes.shape[0] // n_heads)
-                exp_codes_pad = exp_codes.reshape(1, n_heads, sm_codes.shape[0]//n_heads, exp_codes.shape[1])
-            else:
-                sm_codes_pad = sm_codes.unsqueeze(0).unsqueeze(0)
-                sm_widths_pad = sm_widths.unsqueeze(0).unsqueeze(0)
-                exp_codes_pad = exp_codes.unsqueeze(0).unsqueeze(0)
-        elif sm_codes.dim() == 4:
-            sm_codes_pad = sm_codes
-            sm_widths_pad = sm_widths
-            exp_codes_pad = exp_codes
-        elif sm_codes.dim() != 4:
-            raise ValueError(
-                f"Mapping_stat 只支持 2D/3D/4D 输入, 收到 {sm_codes.dim()}D"
-            )
-        if True:#as_l:
-            # K, M, N, Kr, Mr, Nr = M_main_mapping_factor(CIM, sm_codes_pad, in_features, out_features,True)
-            K, M, N, Kr, Mr, Nr = compute_optimal_macro_layout_prefill(CIM.Nmacro, in_features, out_features, sm_codes_pad.shape[2])
+    from .cim_stats import aggregate_bank_steps
+    if as_l not in (0,1): raise ValueError("as_l must be 0 or 1")
+    if sm_codes.ndim==2:
+        if attn:
+            if n_heads<=0 or sm_codes.shape[0]%n_heads:
+                raise ValueError("attention rows must divide into n_heads")
+            codes=sm_codes.reshape(1,n_heads,-1,in_features)
+            widths=sm_widths.reshape(1,n_heads,-1)
         else:
-            K, M, N, Kr, Mr, Nr = compute_optimal_macro_layout_prefill(CIM.Nmacro, in_features, out_features, sm_codes_pad.shape[2])
-
-        # ============================================================
-        # sm_codes / exp_codes: per-token per-dimension, 用 padding_x 处理
-        # sm_widths: per-token only, 需要单独处理
-        # ============================================================
-        sm_div = padding_x(sm_codes_pad, in_features, out_features, CIM, K, M, N, Kr, Mr, Nr)
-        exp_div = padding_x(exp_codes_pad, in_features, out_features, CIM, K, M, N, Kr, Mr, Nr)
-
-        # sm_widths 是 per-token 的 (1D), 不能用 padding_x (需要 4D)
-        # 单独处理: pad token 维度, reshape 到 (Nbatch, Nhead, Mr, M)
-        n_tokens = sm_codes_pad.shape[2]
-        pad_tokens_w = (M * Mr - n_tokens % (M * Mr)) % (M * Mr)
-        sm_widths_4d = sm_widths_pad  # 已经是 (Nbatch, Nhead, n_tokens) 或类似
-        # 确保 sm_widths_pad 是 3D: (Nbatch, Nhead, n_tokens)
-        if sm_widths_pad.dim() == 1:
-            sm_widths_4d = sm_widths_pad.unsqueeze(0).unsqueeze(0)  # (1, 1, n_tokens)
-        elif sm_widths_pad.dim() == 2:
-            sm_widths_4d = sm_widths_pad.unsqueeze(0)  # (1, Nhead_or_batch, n_tokens)
-        # Pad token (dim=2) to M*Mr
-        if pad_tokens_w > 0:
-            sm_widths_4d = F.pad(sm_widths_4d.to(torch.int64), (0, pad_tokens_w), value=0)
-        # Reshape to (Nbatch, Nhead, Mr, M)
-        width_div = sm_widths_4d.reshape(sm_widths_4d.shape[0], sm_widths_4d.shape[1], Mr, M)
-
-        # ============================================================
-        # Popcount with width masking
-        # sm_div shape: (Nbatch, Nhead, Mr, Kr, M, K, Nadder, h)
-        # width_div shape: (Nbatch, Nhead, Mr, M)
-        # 0MMM: sm_codes contain mantissa bits only (no sign bit).
-        # max_bits covers all formats: FP16=10, BF16=7, FP8=3, FP4=1.
-        # ============================================================
-        max_bits = 10
-        shifts = torch.arange(max_bits, device=sm_codes.device, dtype=torch.int64)
-        bit_values = (sm_div.unsqueeze(-1) >> shifts) & 1
-        # bit_values shape: (Nbatch, Nhead, Mr, Kr, M, K, Nadder, h, max_bits)
-        # width_div 需要广播到 (Nbatch, Nhead, Mr, 1, M, 1, 1, 1, 1)
-        bit_valid = (
-            shifts.view(1, 1, 1, 1, 1, 1, 1, 1, max_bits)
-            < width_div.view(width_div.shape[0], width_div.shape[1], Mr, 1, M, 1, 1, 1, 1)
-        )
-        popcount_sum = (bit_values * bit_valid).sum(dim=(-1, -2)).float()
-        # popcount_sum shape: (Nbatch, Nhead, Mr, Kr, M, K, Nadder)
-
-        nonzero_mask = (exp_div != 0) | (sm_div != 0)
-        large = torch.full_like(exp_div, 1 << 30)
-        small = torch.full_like(exp_div, -(1 << 30))
-        exp_min = torch.where(nonzero_mask, exp_div, large).min(dim=-1).values
-        exp_max = torch.where(nonzero_mask, exp_div, small).max(dim=-1).values
-        all_zero = ~nonzero_mask.any(dim=-1)
-        exp_min = torch.where(all_zero, torch.zeros_like(exp_min), exp_min)
-        exp_max = torch.where(all_zero, torch.zeros_like(exp_max), exp_max)
-        exp_range = (exp_max - exp_min).float()
-        # exp_range shape: (Nbatch, Nhead, Mr, Kr, M, K, Nadder)
-
-        # Match ordinary Mapping_stat: mantissa-only popcount plus 2*exp-range.
-        bank_steps = popcount_sum# + 2.0 * exp_range
-        # bank_steps shape: (Nbatch, Nhead, Mr, Kr, M, K, Nadder)
-
-        # ============================================================
-        # Macro-internal bank barrier, macro-external asynchronous execution.
-        # bank barrier: amax over Nadder (dim=-1)
-        # ============================================================
-        round_latency = bank_steps.amax(dim=-1)
-        # round_latency shape: (Nbatch, Nhead, Mr, Kr, M, K)
-        if True:#as_l:
-            # 每个 macro 顺序处理所有 cycle (Mr) 和 K-round (Kr)
-            # squeeze Nhead=1, K=1 for simplicity
-            macro_total = round_latency.sum(dim=(0, 1, 2, 3))
-            # macro_total shape: (Nbatch, M)
-
-            # 整层延迟 = 最慢 macro
-            layer_latency_single_weight_tile = macro_total.max()
-        else:
-            # round_latency shape: (Nbatch, Nhead, Mr, Kr, M, K)
-            # # Step 2: K 同步 → 每 K macro 耗时
-            k_max = round_latency.amax(dim=-1)
-
-            # Step 2: M 同步 → 每 M macro 耗时
-            m_max = k_max.amax(dim=-1)
-
-            # 单层总延迟 = 最慢 macro 的总执行时间 (直接取全局最大值标量)
-            layer_latency_single_weight_tile = m_max.sum()
-
-        # ============================================================
-        # Dense baseline: 与 round_latency 同形状, 每个值 = h_eff * bit_width
-        # round_latency shape: (Nbatch, Nhead, Mr, Kr, M, K)
-        # 每个 bank 满载工作量 = h_eff × width (per-token bit 数)
-        # bank 内 Nadder 个 bank 满载相同 → amax(Nadder) = h_eff * width
-        # 所以 dense_round_latency 每个位置 = h_eff * width_div 对应位置的 bit 数
-        # ============================================================
+            codes=sm_codes[None,None];widths=sm_widths.reshape(1,1,-1)
+    elif sm_codes.ndim==3:
+        codes=sm_codes[:,None];widths=sm_widths[:,None]
+    elif sm_codes.ndim==4:
+        codes=sm_codes;widths=sm_widths
+    else: raise ValueError("mixed mapping expects 2D/3D/4D codes")
+    if codes.shape[-1]!=in_features or tuple(widths.shape)!=tuple(codes.shape[:-1]):
+        raise ValueError("mixed code/width shapes are inconsistent")
+    if (widths<0).any() or (widths>10).any() or (widths!=widths.round()).any():
+        raise ValueError("mantissa widths must be integers in [0,10]")
+    if (codes<0).any() or (codes >= (2**widths[...,None])).any():
+        raise ValueError("mantissa code exceeds its declared width")
+    fn=compute_optimal_macro_layout_prefill if is_prefill else compute_optimal_macro_layout_decode
+    layout=fn(CIM.Nmacro,in_features,out_features,codes.shape[-2],
+              h=CIM.h,w=CIM.w,Nadder=CIM.Nadder)
+    kf,mf,nf,kr,mr,nr=layout
+    counts=torch.zeros_like(codes,dtype=torch.float32)
+    for bit in range(10): counts+=((codes.long()>>bit)&1)*(widths[...,None]>bit)
+    sparse_bank=padding_x(counts,in_features,out_features,CIM,*layout).sum(-1)
+    dense_bank=padding_x(widths[...,None].expand_as(codes).float(),
+                         in_features,out_features,CIM,*layout).sum(-1)
+    sparse=aggregate_bank_steps(sparse_bank,bool(as_l))
+    dense=aggregate_bank_steps(dense_bank,bool(as_l))
+    work=sparse_bank.sum()/max(1,mf*kf*CIM.Nadder)
+    return work,sparse,dense,sparse*nr,dense*nr,work*nr
 
 
-        # ============================================================
-        # Dense baseline 聚合: 与 round_latency → layer_latency_single_weight_tile
-        # 完全相同的聚合路径
-        #
-        # 满载基线 = h(64) × 平均尾数位宽。位宽按混精三档配比加权:
-        #   high → FP16 (10 mantissa bits), mid → FP8 (3), low → FP4 (1)
-        # 配比由调用方从 QuantizedLinear / QuantizedMatMul 实例直接传入
-        # (self.mp_high_ratio / self.mp_low_ratio), 与实际量化行为同源。
-        # ============================================================
-        mp_mid_ratio = 1.0 - mp_high_ratio - mp_low_ratio
-        if mp_high_ratio < 0 or mp_low_ratio < 0 or mp_mid_ratio < 0:
-            raise ValueError(
-                f"invalid mixed-precision ratios: high={mp_high_ratio}, "
-                f"low={mp_low_ratio}, mid={mp_mid_ratio}"
-            )
-        avg_bits = (
-            mp_high_ratio * 10
-            + mp_low_ratio * 1
-            + mp_mid_ratio * 3
-        )
-
-        if round_latency.shape[1] == 1:  # linear (Nhead=1)
-           layer_ideal_single_weight_tile = (
-               64 * avg_bits * Kr * Mr
-           )
-        else:  # attention matmul (Nhead>1, 各 head 串行)
-           layer_ideal_single_weight_tile = (
-               64 * avg_bits * Kr * Mr * round_latency.shape[1]
-           )
-
-        # Same return convention as ordinary Mapping_stat.
-        weight_cycles = Nr
-        idea_sp = bank_steps.sum()/M/K/CIM.Nadder
-        boperation = bank_steps  # dense baseline 不再单独计算 boperation
-        layer_latency = layer_latency_single_weight_tile * weight_cycles
-        layer_ideal_latency = layer_ideal_single_weight_tile * weight_cycles
-        ideal_sparsity_op = idea_sp * weight_cycles
 
 
-        return (
-            idea_sp,
-            layer_latency_single_weight_tile,
-            layer_ideal_single_weight_tile,
-            layer_latency,
-            layer_ideal_latency,
-            ideal_sparsity_op,
-        )
+def as_latency(CIM, x, in_features, out_features, is_prefill=True):
+    """Compatibility tuple using actual FP8 mantissa codes in both phases."""
+    from .cim_stats import measure_mapping
+    result=measure_mapping(CIM,x,"e4m3",in_features,out_features,is_prefill)
+    nr=result["layout"][-1]
+    sparse=result["sparse_steps"];dense=result["dense_steps"]
+    return sparse/nr,sparse/nr,dense/nr,sparse,dense,sparse
 
-
-def as_latency(
-        CIM: CIM_sys,
-        x: torch.Tensor,
-        in_features: int,
-        out_features: int,
-        is_prefill: bool = True
-        ):
-        if is_prefill:
-
-            # ============================================================
-            # 统一输入维度: 强制 (Nbatch, Nhead, Nseq, Ndim) 4D
-            # ============================================================
-            if x.dim() == 3:
-            # (B, S, D) -> (B, 1, S, D)
-                x_pad = x.unsqueeze(0)
-            elif x.dim() == 2:
-                # (S, D) -> (1, 1, S, D)
-                x_pad = x.unsqueeze(0).unsqueeze(0)
-            elif x.dim() == 4:
-                x_pad = x
-            elif x.dim() != 4:
-                raise ValueError(
-                    f"Mapping_stat 只支持 2D/3D/4D 输入, 收到 {x.dim()}D"
-                )
-
-            K, M, N, Kr, Mr, Nr =  compute_optimal_macro_layout_prefill(CIM.Nmacro, in_features, out_features, x_pad.shape[2])
-
-
-            x_div = padding_x(x_pad, in_features, out_features, CIM, K, M, N, Kr, Mr, Nr)
-
-            del x_pad
-
-            exp_range_per_row, sign_mantissa, aligned_fp8_bits = _to_int8_bits(x_div)
-            # exp_range_per_row, sign_mantissa, aligned_fp8_bits = _to_fp8_e4m3_bits(x_div)
-            # exp_range_per_row, sign_mantissa, aligned_fp8_bits = _to_bf16_e8m7_bits(x_div)
-            del aligned_fp8_bits
-            del x_div
-
-            # # 每 dim 维度的 active bits (FP8 mantissa only = 3-bit: 0b0MMM)
-            # shifts = torch.arange(0, 3, device=sign_mantissa.device)
-
-            # 每 dim 维度的 active bits (BF16 mantissa only = 7-bit: 0b0MMMMMMM)
-            shifts = torch.arange(0, 7, device=sign_mantissa.device)
-
-            bits = (sign_mantissa.unsqueeze(-1) >> shifts) & 1
-            c = bits.sum(dim=-1).float()
-
-
-            # 每个 bank 的实际量 = dim方向active_bits之和 + 2×exp_range
-            c = c.sum(dim=-1) + exp_range_per_row
-
-            
-            fp8_stat_b1 = c + exp_range_per_row
-            all_bits_base = bits.shape[-1] * bits.shape[-2]
-
-            del c
-            del bits
-
-            # Step 1: bank 同步 → 每 macro 每 cycle 的耗时
-            bank_max = fp8_stat_b1.amax(dim=-1)
-            # bank_max shape: (Nbatch, Nhead, Mr, Kr, M, K)
-
-            # ============================================================
-            # Macro 间异步统计模型 (与 stat_manager.Mapping_stat_bf16 一致)
-            #
-            # 每个 macro 顺序处理自己分配到的所有 cycle 和 K-round:
-            #   macro_total = sum over (Mr, Kr) → 每个 macro 的总执行时间
-            #   layer_latency = max over M → 整层由最慢 macro 决定
-            # ============================================================
-
-            # Step 2: 每个 macro 累加所有 cycle (Mr) 和 K-round (Kr)
-            # bank_max shape: (Nbatch, Nhead, Mr, Kr, M, K)
-            # 对 Nhead=1, K=1 的情况, 先 squeeze 再 sum
-            macro_total = bank_max.sum(dim=(0, 1, 2, 3))
-            # macro_total shape: (Nbatch, M) — 每个 macro 的总执行步数
-
-            # Step 3: 整层延迟 = 最慢 macro
-            # macro_total shape: (Nbatch, M) — 每个 macro 的总执行步数
-            # 取每个 batch 内最慢 macro，再 sum over batch → 标量
-            layer_latency = macro_total.max()
-            # layer_latency: 标量 tensor
-
-            # 单层满载总延迟 = 每 cycle 满载开销 × cycle 总数
-            layer_ideal_latency = 192 * Kr * Mr
-            idea_sp = fp8_stat_b1.sum()/M/K/CIM.Nadder
-            # boperation 保持原语义: 理想满载时单元素操作数
-            boperation = torch.full_like(fp8_stat_b1, all_bits_base)
-            return idea_sp, layer_latency, layer_ideal_latency, layer_latency * Nr, layer_ideal_latency * Nr, idea_sp * Nr
-        else:
-
-            # ============================================================
-            # 统一输入维度: 强制 (Nbatch, Nhead, Nseq, Ndim) 4D
-            # ============================================================
-            if x.dim() == 3:
-            # (B, S, D) -> (B, 1, S, D)
-                x_pad = x.unsqueeze(0)
-            elif x.dim() == 2:
-                # (S, D) -> (1, 1, S, D)
-                x_pad = x.unsqueeze(0).unsqueeze(0)
-            elif x.dim() == 4:
-                x_pad = x
-            elif x.dim() != 4:
-                raise ValueError(
-                    f"Mapping_stat 只支持 2D/3D/4D 输入, 收到 {x.dim()}D"
-                )
-
-            K, M, N, Kr, Mr, Nr = compute_optimal_macro_layout_decode(CIM.Nmacro, in_features, out_features, x_pad.shape[2])
-
-
-            x_div = padding_x(x_pad, in_features, out_features, CIM, K, M, N, Kr, Mr, Nr)
-
-            del x_pad
-
-            # exp_range_per_row, sign_mantissa, aligned_fp8_bits = _to_int8_bits(x_div)
-            exp_range_per_row, sign_mantissa, aligned_fp8_bits = _to_fp8_e4m3_bits(x_div)
-            # exp_range_per_row, sign_mantissa, aligned_fp8_bits = _to_bf16_e8m7_bits(x_div)
-            del aligned_fp8_bits
-            del x_div
-
-            # 每 dim 维度的 active bits (FP8 mantissa only = 3-bit: 0b0MMM)
-            shifts = torch.arange(0, 3, device=sign_mantissa.device)
-
-            # # 每 dim 维度的 active bits (BF16 mantissa only = 7-bit: 0b0MMMMMMM)
-            # shifts = torch.arange(0, 7, device=sign_mantissa.device)
-
-            bits = (sign_mantissa.unsqueeze(-1) >> shifts) & 1
-            c = bits.sum(dim=-1).float()
-
-
-            # 每个 bank 的实际量 = dim方向active_bits之和 + 2×exp_range
-            c = c.sum(dim=-1) + exp_range_per_row
-
-            
-            fp8_stat_b1 = c + exp_range_per_row
-            all_bits_base = bits.shape[-1] * bits.shape[-2]
-
-            del c
-            del bits
-
-            # Step 1: bank 同步 → 每 macro 每 cycle 的耗时
-            bank_max = fp8_stat_b1.amax(dim=-1)
-            # bank_max shape: (Nbatch, Nhead, Mr, Kr, M, K)
-
-            # ============================================================
-            # Macro 间异步统计模型 (与 stat_manager.Mapping_stat_bf16 一致)
-            #
-            # 每个 macro 顺序处理自己分配到的所有 cycle 和 K-round:
-            #   macro_total = sum over (Mr, Kr) → 每个 macro 的总执行时间
-            #   layer_latency = max over M → 整层由最慢 macro 决定
-            # ============================================================
-
-            # Step 2: 每个 macro 累加所有 cycle (Mr) 和 K-round (Kr)
-            # bank_max shape: (Nbatch, Nhead, Mr, Kr, M, K)
-            # 对 Nhead=1, K=1 的情况, 先 squeeze 再 sum
-            macro_total = bank_max.sum(dim=(0, 1, 2, 3))
-            # macro_total shape: (Nbatch, M) — 每个 macro 的总执行步数
-
-            # Step 3: 整层延迟 = 最慢 macro
-            # macro_total shape: (Nbatch, M) — 每个 macro 的总执行步数
-            # 取每个 batch 内最慢 macro，再 sum over batch → 标量
-            layer_latency = macro_total.max()
-            # layer_latency: 标量 tensor
-
-            # 单层满载总延迟 = 每 cycle 满载开销 × cycle 总数
-            layer_ideal_latency = 192 * Kr * Mr * bank_max.shape[1]
-            idea_sp = fp8_stat_b1.sum()/M/K/CIM.Nadder
-            # boperation 保持原语义: 理想满载时单元素操作数
-            boperation = torch.full_like(fp8_stat_b1, all_bits_base)
-            return idea_sp, layer_latency, layer_ideal_latency, layer_latency * Nr, layer_ideal_latency * Nr, idea_sp * Nr
        
 
 
-def sy_latency(
-        CIM: CIM_sys,
-        x: torch.Tensor,
-        in_features: int,
-        out_features: int,
-        is_prefill: bool = True
-        ):
-
-        Nmacro = CIM.Nmacro
-        Nadder = CIM.Nadder
-        h = CIM.h
-        w = CIM.w
-
-        if is_prefill:
-
-            # ============================================================
-            # 统一输入维度: 强制 (Nbatch, Nhead, Nseq, Ndim) 4D
-            # ============================================================
-            if x.dim() == 3:
-            # (B, S, D) -> (B, 1, S, D)
-                x_pad = x.unsqueeze(1)
-            elif x.dim() == 2:
-                # (S, D) -> (1, 1, S, D)
-                x_pad = x.unsqueeze(0).unsqueeze(0)
-            elif x.dim() == 4:
-                x_pad = x
-            elif x.dim() != 4:
-                raise ValueError(
-                    f"Mapping_stat 只支持 2D/3D/4D 输入, 收到 {x.dim()}D"
-                )
-
-            K, M, N, Kr, Mr, Nr = compute_optimal_macro_layout_decode(CIM.Nmacro, in_features, out_features, x_pad.shape[2])
-
-
-            x_div = padding_x(x_pad, in_features, out_features, CIM, K, M, N, Kr, Mr, Nr)
-
-            del x_pad
-
-            # exp_range_per_row, sign_mantissa, aligned_fp8_bits = _to_fp8_e4m3_bits(x_div)
-            exp_range_per_row, sign_mantissa, aligned_fp8_bits = _to_bf16_e8m7_bits(x_div)
-            del aligned_fp8_bits
-            del x_div
-
-            # # 每 dim 维度的 active bits
-            # shifts = torch.arange(0, 4, device=sign_mantissa.device)
-
-            # 每 dim 维度的 active bits (BF16 mantissa only = 7-bit: 0b0MMMMMMM)
-            shifts = torch.arange(0, 7, device=sign_mantissa.device)
-
-            bits = (sign_mantissa.unsqueeze(-1) >> shifts) & 1
-            c = bits.sum(dim=-1).float()
-
-            # 每个 bank 的实际量 = dim方向active_bits之和 + 2×exp_range
-            c = c.sum(dim=-1) + exp_range_per_row
-
-            
-            fp8_stat_b1 = c + exp_range_per_row
-            all_bits_base = bits.shape[-1] * bits.shape[-2]
-
-            del c
-            del bits
-
-            # ============================================================
-            # Macro 间完全异步的同步模型
-            #
-            # fp8_stat_b1 shape: (Nbatch, Nhead, Mround, kround, M, K, Nadder)
-            #                      dim:    0       1      2        3          4          5         6
-            #
-            # 模型假设:
-            #   - 每个 macro 内 Nadder 个 bank 同步 (bank 级屏障)
-            #   - macro 之间完全异步, 各自跑完自己的所有 cycle 后才出结果
-            #   - 每个 macro 执行完一个 cycle 立即进入下一个, 不等待其它 macro
-            #
-            # 步骤:
-            #   1) bank_max = fp8_stat_b1.amax(Nadder)         → 每 macro 当前 cycle 的耗时
-            #   2) macro_total = sum(Ncycle, Nrowcycle)         → 每 macro 的总执行时间(自己跑完所有 cycle)
-            #   3) all_bits    = max(Nsamecol, Nsamerow)        → 16 个 macro 中最慢的 = 本次延迟
-            # ============================================================
-
-            # Step 1: bank 同步 → 每 macro 每 cycle 的耗时
-            bank_max = fp8_stat_b1.amax(dim=-1)
-
-            # Step 2: K 同步 → 每 K macro 耗时
-            k_max = bank_max.amax(dim=-1)
-
-            # Step 2: M 同步 → 每 M macro 耗时
-            m_max = k_max.amax(dim=-1)
-
-            # 单层总延迟 = 最慢 macro 的总执行时间 (直接取全局最大值标量)
-            layer_latency = m_max.sum()
-
-            # 单层满载总延迟 = 每 cycle 满载开销 × cycle 总数
-            # 7 mantissa bits × 64 dims per bank = 448
-            layer_ideal_latency = 448 * Kr * Mr
-            del m_max
-
-            # boperation 保持原语义: 理想满载时单元素操作数
-            boperation = torch.full_like(fp8_stat_b1, all_bits_base)
-            return fp8_stat_b1, layer_latency, layer_ideal_latency, layer_latency * Nr, layer_ideal_latency * Nr, fp8_stat_b1 * Nr
-        else:
-            return 0, 0, 0, 0, 0, 0
+def sy_latency(CIM, x, in_features, out_features, is_prefill=True):
+    """Synchronous counterpart using the SAME FP8 bit scope and mapping."""
+    from .cim_stats import measure_mapping
+    result=measure_mapping(CIM,x,"e4m3",in_features,out_features,is_prefill,asynchronous=False)
+    nr=result["layout"][-1];sparse=result["sparse_steps"];dense=result["dense_steps"]
+    return sparse/nr,sparse/nr,dense/nr,sparse,dense,sparse

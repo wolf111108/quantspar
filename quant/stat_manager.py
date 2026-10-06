@@ -13,10 +13,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
-from .quant_spec import QuantSpec
+from .quant_spec import QuantSpec, parse_quant_spec
+from .cim_stats import sparse_counts, measure_mapping, unit_sparse_counts
 from typing import Optional, Tuple, Dict
 from .mapping import CIM_sys, Mapping_stat, sy_latency, Mapping_stat_dynamic
-from .causal_sparse_stats import causal_masked_sparse_stats_fp
 
 class QuantStatistics:
     """
@@ -105,7 +105,10 @@ class QuantStatistics:
         scales = {}
         
         if self.w_scales:
-            scales['w_scale'] = max(self.w_scales)
+            if isinstance(self.w_scales[0], torch.Tensor):
+                scales['w_scale'] = torch.stack(self.w_scales).amax(dim=0)
+            else:
+                scales['w_scale'] = max(self.w_scales)
             scales['a_scale'] = max(self.a_scales)
             scales['o_scale'] = max(self.o_scales)
         
@@ -136,7 +139,9 @@ class QuantStatManager:
     PyTorch hooks.
     """
 
-    def __init__(self, scale_dir: str, nmacro: int = 32, as_l: int = 1):
+    def __init__(self, scale_dir: str, nmacro: int = 32, as_l: int = 1, *,
+                 h: int = 64, w: int = 48, banks: int = 16,
+                 bit_scope: str = "mantissa", cycles_per_effective_bit: float = 1):
         """
         Initialize statistics manager.
 
@@ -148,6 +153,15 @@ class QuantStatManager:
         self.scale_dir = scale_dir
         self.nmacro = int(nmacro)
         self.as_l = int(as_l)
+        if self.as_l not in (0,1): raise ValueError("as_l must be 0 or 1")
+        if bit_scope not in ("mantissa","sign_mantissa","storage"): raise ValueError("invalid bit_scope")
+        if min(h,w,banks,self.nmacro)<=0: raise ValueError("CIM geometry must be positive")
+        if not math.isfinite(cycles_per_effective_bit) or cycles_per_effective_bit<=0:
+            raise ValueError("cycles_per_effective_bit must be finite and positive")
+        self.cim_geometry = dict(height=int(h),width=int(w),banks=int(banks),macros=self.nmacro)
+        self.bit_scope = bit_scope
+        self.cim_records = []
+        self._static_weights_seen = set()
         self.stats: Dict[str, QuantStatistics] = {}
         self.hooks: List[Any] = []
 
@@ -223,11 +237,11 @@ class QuantStatManager:
         self.pv_count = 0
 
         # Hardware timing model:
-        # each effective activation bit requires three clock cycles.
+        # each effective activation bit uses the configured clock-cycle factor.
         # Mapping_stat / Mapping_stat_dynamic return effective-bit steps;
         # conversion to physical time applies this factor exactly once.
         self.clock_freq_hz = 1.0e9
-        self.cycles_per_effective_bit = 1
+        self.cycles_per_effective_bit = cycles_per_effective_bit
 
         self.q_proj_SACIM_latency_stat = 0
         self.q_proj_baseline_latency_stat = 0
@@ -326,6 +340,15 @@ class QuantStatManager:
         self.current_phase = phase  #add
 
     def reset_sparsity(self):  #add
+        self.cim_records.clear();self._static_weights_seen.clear();self.per_layer_latency.clear()
+        for prefix in ('activation','weight','dynamic_weight'):
+            for suffix in ('zero_count','element_count','bit_count','0bit_count','sparsebit_count',
+                           'amplitude_zero_bits_total','amplitude_bit_count'):
+                setattr(self,prefix+'_'+suffix,0)
+        for name in list(vars(self)):
+            if name.endswith(('_latency_stat','_sparsity_speedup')):
+                setattr(self,name,0)
+        self.latency=0
         self.total_zero_count = 0  #add
         self.total_element_count = 0  #add
         self.total_bit_count = 0  #add
@@ -407,7 +430,7 @@ class QuantStatManager:
                 f"{counter['total_sparsebit_count'] / bits:.4%}"  #add
             )  #add
             print(  #add
-                f"  Sign Magnitude编码比例: "  #add
+                f"  所选编码零比特比例: "  #add
                 f"{counter['total_amplitude_zero_bits_total'] / bits:.4%}"  #add
             )  #add
             print(  #add
@@ -1768,17 +1791,15 @@ class QuantStatManager:
 
         Nmacro = getattr(self, 'nmacro', 16)
         CIM = CIM_sys(
-            h=64,
-            w=48,
-            Nadder=16,
+            h=self.cim_geometry["height"],
+            w=self.cim_geometry["width"],
+            Nadder=self.cim_geometry["banks"],
             Nmacro=Nmacro,
             freq=int(1e9),
         )
         as_l = getattr(self, 'as_l', 1)
         is_prefill = (getattr(self, "current_phase", "") == "prefill")
         Nbankall = CIM.Nmacro * CIM.Nadder
-        if not is_prefill:
-            return
 
         # ============================================================
         # 1. 构造 per-token sm_codes 和 sm_widths
@@ -1793,7 +1814,7 @@ class QuantStatManager:
         # 2. Mapping_stat_dynamic: per-token 混精延迟统计
         # ============================================================
         if(layer_name == "q_proj" or layer_name == "k_proj" or layer_name == "v_proj"):
-            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, False, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio)
+            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, False, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio, is_prefill=is_prefill, as_l=self.as_l)
             effective_cim = cim.sum()
             all_boperation = boperation
             utlization_ratio = effective_cim / (base.sum() * CIM.Nmacro * CIM.Nadder)
@@ -1812,7 +1833,7 @@ class QuantStatManager:
                 pass
 
         elif(layer_name == "qk_matmul"):
-            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, True, n_heads=n_heads, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio)
+            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, True, n_heads=n_heads, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio, is_prefill=is_prefill, as_l=self.as_l)
             effective_cim = cim.sum()
             all_boperation = boperation
             utlization_ratio = effective_cim / (base.sum() * CIM.Nmacro * CIM.Nadder)
@@ -1831,7 +1852,7 @@ class QuantStatManager:
             else:
                 pass
         elif(layer_name == "pv_matmul"):
-            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, True, n_heads=n_heads, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio)
+            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, True, n_heads=n_heads, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio, is_prefill=is_prefill, as_l=self.as_l)
             effective_cim = cim.sum()
             all_boperation = boperation
             utlization_ratio = effective_cim / (base.sum() * CIM.Nmacro * CIM.Nadder)
@@ -1850,7 +1871,7 @@ class QuantStatManager:
                 pass
 
         elif(layer_name == "o_proj" or layer_name == "out_proj"):
-            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, False, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio)
+            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, False, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio, is_prefill=is_prefill, as_l=self.as_l)
             effective_cim = cim.sum()
             all_boperation = boperation
             utlization_ratio = effective_cim / (base.sum() * CIM.Nmacro * CIM.Nadder)
@@ -1868,7 +1889,7 @@ class QuantStatManager:
             else:
                 pass
         elif(layer_name == "gate_proj"):
-            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, False, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio)
+            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, False, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio, is_prefill=is_prefill, as_l=self.as_l)
             effective_cim = cim.sum()
             all_boperation = boperation
             utlization_ratio = effective_cim / (base.sum() * CIM.Nmacro * CIM.Nadder)
@@ -1886,7 +1907,7 @@ class QuantStatManager:
             else:
                 pass
         elif(layer_name == "up_proj" or layer_name == "fc1"):
-            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, False, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio)
+            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, False, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio, is_prefill=is_prefill, as_l=self.as_l)
             effective_cim = cim.sum()
             all_boperation = boperation
             utlization_ratio = effective_cim / (base.sum() * CIM.Nmacro * CIM.Nadder)
@@ -1902,7 +1923,7 @@ class QuantStatManager:
                 self.latency = self.latency + (layer_latency)/CIM.freq
                 self.baseline_latency_stat = self.baseline_latency_stat + self._cycles_to_seconds(layer_ideal_latency)
         elif(layer_name == "down_proj" or layer_name == "fc2"):
-            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, False, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio)
+            cim, base, boperation, layer_latency, layer_ideal_latency, ideal_sparsity_op = Mapping_stat_dynamic(CIM,sm_codes, sm_widths, exp_codes, in_features, out_features, False, mp_high_ratio=mp_high_ratio, mp_low_ratio=mp_low_ratio, is_prefill=is_prefill, as_l=self.as_l)
             effective_cim = cim.sum()
             all_boperation = boperation
             utlization_ratio = effective_cim / (base.sum() * CIM.Nmacro * CIM.Nadder)
@@ -2208,175 +2229,128 @@ class QuantStatManager:
 
 
 
-    def collect_quant_activation(
-        self,
-        layer_name: str,
-        layer_idx: int,
-        activation: torch.Tensor,
-        FP_activation: torch.Tensor,
-        weight: torch.Tensor,
-        weight_spec: QuantSpec,
-        spec: QuantSpec,
-        digit_size: int,
-        parallelism: int,
-        in_features: int,
-        out_features: int
-    ):
-        """
-        Collect quantized activation statistics.
-
-        修改点:
-        1. 保留 total_amplitude_zero_bits_total / PPL 需要的统计。
-        2. int / fp 都改成 chunked 统计。
-        3. 避免对 [B, H, L, L] attention map 一次性生成 us_tensor / bit。
-        """
-        if activation is None:  #add
-            return  #add
-
-
-        self.record_collected_layer_name(layer_name, layer_idx)  #add
-        Nmacro = getattr(self, 'nmacro', 16)
-        CIM = CIM_sys(
-            h=64,
-            w=48,
-            Nadder=16,
-            Nmacro=Nmacro,
-            freq=int(1e9),
-        )
-        is_prefill = (getattr(self, "current_phase", "") == "prefill")
-        method = "as_fp8"
-        collect_prefill = True
-        if spec is None:  #add
-            return  #add
-        
-        # Estimate hardware mapping statistics for this linear operation
-        # if(layer_name == "q_proj" and layer_idx == 0):
-        #     bf16_stat_b2, fp8_stat_b2, int8_stat_b2, bf16_stat_b1, fp8_stat_b1, int8_stat_b1 = self.Mapping_stat(FP_activation, in_features, out_features)
-        #     self.mapping_stat_bf16_stat_b2.append(bf16_stat_b2)
-        #     self.mapping_stat_fp8_stat_b2.append(fp8_stat_b2)
-        #     self.mapping_stat_int8_stat_b2.append(int8_stat_b2)
-        #     self.mapping_stat_bf16_stat_b1.append(bf16_stat_b1)
-        #     self.mapping_stat_fp8_stat_b1.append(fp8_stat_b1)
-        #     self.mapping_stat_int8_stat_b1.append(int8_stat_b1)
-
-
-        # elif(layer_name == "qk_matmul_A" and layer_idx == 0):
-        #     self.qk_matmul_A_mapping_stat.append(self.Mapping_stat(FP_activation, in_features, out_features))
-        # elif(layer_name == "qk_matmul_B" and layer_idx == 0):
-        #     self.qk_matmul_B_mapping_stat.append(self.Mapping_stat(FP_activation, in_features, out_features))
-        # elif(layer_name == "pv_matmul_A" and layer_idx == 0):
-        #     self.pv_matmul_A_mapping_stat.append(self.Mapping_stat(FP_activation, in_features, out_features))
-        # elif(layer_name == "pv_matmul_B" and layer_idx == 0):
-        #     self.pv_matmul_B_mapping_stat.append(self.Mapping_stat(FP_activation, in_features, out_features))
-        # elif(layer_name == "o_proj" and layer_idx == 0):
-        #     self.o_proj_mapping_stat.append(self.Mapping_stat(FP_activation, in_features, out_features))
-        # elif(layer_name == "up_proj" and layer_idx == 0):
-        #     self.up_proj_mapping_stat.append(self.Mapping_stat(FP_activation, in_features, out_features))
-        # elif(layer_name == "down_proj" and layer_idx == 0):
-        #     self.down_proj_mapping_stat.append(self.Mapping_stat(FP_activation, in_features, out_features))
-        # cim, base, boperation = self.Mapping_stat(FP_activation, in_features, out_features)
-        # all_boperation = boperation.sum()
-        # utlization_ratio = cim.sum()/base.sum()
-
-        # if collect_prefill:
-        #     if is_prefill:
-        #         self.collect_latency_prefill(CIM, layer_name, layer_idx, FP_activation, in_features, out_features, method)
-        #     else:
-        #         pass
-        # else:
-        #     pass
-
-        if spec.kind == "int":  #add
-            sparse = self.compute_sparse_stats(  #add
-                spec.bits,  #add
-                activation,  #add
-                0,  #add
-                chunk_size=self.sparse_stat_chunk_size,  #add
-            )  #add
-        elif spec.kind == "fp":  #add
-            sparse = self.compute_sparse_stats_fp(  #add
-                spec.fmt,  #add
-                activation,  #add
-                0.0,  #add
-                chunk_size=self.sparse_stat_chunk_size,  #add
-            )  #add
-        elif spec.kind == "bf":  #add
-            sparse = self.compute_sparse_stats_fp(  #add
-                spec.fmt,  #add
-                activation,  #add
-                0.0,  #add
-                chunk_size=self.sparse_stat_chunk_size,  #add
-            )  #add
-        else:  #add
-            pass
-
-        # if weight_spec.kind == "int":  #add
-        #     wt_sparse = self.compute_sparse_stats(  #add
-        #         weight_spec.bits,  #add
-        #         weight,  #add
-        #         0,  #add
-        #         chunk_size=self.sparse_stat_chunk_size,  #add
-        #     )  #add
-        # elif weight_spec.kind == "fp":  #add
-        #     wt_sparse = self.compute_sparse_stats_fp(  #add
-        #         weight_spec.fmt,  #add
-        #         weight,  #add
-        #         0.0,  #add
-        #         chunk_size=self.sparse_stat_chunk_size,  #add
-        #     )  #add
-        # elif weight_spec.kind == "bf":  #add
-        #     wt_sparse = self.compute_sparse_stats_fp(  #add
-        #         weight_spec.fmt,  #add
-        #         weight,  #add
-        #         0.0,  #add
-        #         chunk_size=self.sparse_stat_chunk_size,  #add
-        #     )  #add
-        # else:  #add
-        #     pass
-
-
+    def collect_quant_activation(self,layer_name,layer_idx,activation,FP_activation,
+                                 weight,weight_spec,spec,digit_size,parallelism,
+                                 in_features,out_features):
+        if activation is None or spec is None or spec.kind == "none": return
+        self.record_collected_layer_name(layer_name,layer_idx)
+        sparse=sparse_counts(activation,spec,self.bit_scope,chunk_size=self.sparse_stat_chunk_size)
         self.collect_activation_sparsity(*sparse)
-        # if(layer_name == "qk_matmul" or layer_name == "pv_matmul"):
-        #     self.collect_dynamic_weight_sparsity(*wt_sparse)
-        # else:
-        #     self.collect_weight_sparsity(*wt_sparse)
+        self.collect_unit_sparsity(layer_name,layer_idx,activation,spec)
+        attention=layer_name in {"qk_matmul","pv_matmul","qk_matmul_A","pv_matmul_A"}
+        wt=sparse_counts(weight,weight_spec,"storage",chunk_size=self.sparse_stat_chunk_size)
+        key=(self.current_phase,layer_name,layer_idx,weight_spec.name())
+        if attention: self.collect_dynamic_weight_sparsity(*wt)
+        elif key not in self._static_weights_seen:
+            self.collect_weight_sparsity(*wt);self._static_weights_seen.add(key)
+        cim=CIM_sys(h=self.cim_geometry["height"],w=self.cim_geometry["width"],
+                    Nadder=self.cim_geometry["banks"],Nmacro=self.nmacro,freq=int(self.clock_freq_hz))
+        mapped_activation=activation if attention else activation.reshape(-1,in_features)
+        result=measure_mapping(cim,mapped_activation,spec,in_features,out_features,
+                               self.current_phase!="decode",self.bit_scope,bool(self.as_l))
+        result.update(layer_name=layer_name,layer_idx=layer_idx,phase=self.current_phase,
+                      input_shape=list(activation.shape),
+                      weight_format=weight_spec.name(),activation_format=spec.name(),
+                      geometry=self.cim_geometry.copy(),weight_sparsity=dict(
+                          elements=wt[0],zero_elements=wt[1],bits=wt[2],zero_bits=wt[3]),
+                      activation_sparsity=dict(elements=sparse[0],zero_elements=sparse[1],
+                                               bits=sparse[2],zero_bits=sparse[3]))
+        result["sparse_compute_seconds"]=self._cycles_to_seconds(result["sparse_steps"])
+        result["dense_compute_seconds"]=self._cycles_to_seconds(result["dense_steps"])
+        self.cim_records.append(result)
+        self._accumulate_cim_record(result)
 
-        # # Record per-layer sparsity stats  #add
-        # if not is_prefill:  #add
-        #     _key = f"{layer_name}_{layer_idx}"  #add
-        #     if _key not in self.per_layer_latency:  #add
-        #         self.per_layer_latency[_key] = {  #add
-        #             "layer_name": layer_name,  #add
-        #             "layer_idx": layer_idx,  #add
-        #             "SACIM_latency": 0.0,  #add
-        #             "baseline_latency": 0.0,  #add
-        #             "effective_cim": 0.0,  #add
-        #             "base_sum": 0.0,  #add
-        #         }  #add
-        #     _entry = self.per_layer_latency[_key]  #add
-        #     _total_num, _abs_less_th, _total_bits, _zero_bits_total, _sparse_bits_total, _amp_zero = sparse  #add
-        #     _entry["total_elements"] = _entry.get("total_elements", 0) + int(_total_num)  #add
-        #     _entry["zero_elements"] = _entry.get("zero_elements", 0) + int(_abs_less_th)  #add
-        #     _entry["total_bits"] = _entry.get("total_bits", 0) + int(_total_bits)  #add
-        #     _entry["zero_bits"] = _entry.get("zero_bits", 0) + int(_zero_bits_total)  #add
-        #     _entry["sparse_bits"] = _entry.get("sparse_bits", 0) + int(_sparse_bits_total)  #add
-        #     _entry["amplitude_zero_bits"] = _entry.get("amplitude_zero_bits", 0) + int(_amp_zero)  #add
-        #     _entry["zero_rate"] = _entry["zero_elements"] / _entry["total_elements"] if _entry["total_elements"] > 0 else 0.0  #add
-        #     _entry["sparse_bit_rate"] = _entry["sparse_bits"] / _entry["total_bits"] if _entry["total_bits"] > 0 else 0.0  #add
-        #     _entry["amplitude_zero_bit_rate"] = _entry["amplitude_zero_bits"] / _entry["total_bits"] if _entry["total_bits"] > 0 else 0.0  #add
-        #     _entry["ideal_speed_up"] = 1 / (1 - _entry["sparse_bit_rate"]) if _entry["sparse_bit_rate"] < 1 else float("inf")  #add
-        #     _entry["1_bits"] = _entry["total_bits"] - _entry["amplitude_zero_bits"]  #add
+    def _accumulate_cim_record(self,result):
+        sparse=result["sparse_compute_seconds"];dense=result["dense_compute_seconds"]
+        self.SACIM_latency_stat+=sparse;self.baseline_latency_stat+=dense
+        self.latency+=sparse
+        names={"q_proj":"q_proj","k_proj":"q_proj","v_proj":"q_proj",
+               "qk_matmul":"qk_matmul","pv_matmul":"pv_matmul",
+               "o_proj":"o_proj","out_proj":"o_proj","gate_proj":"gate_proj",
+               "up_proj":"up_proj","down_proj":"down_proj"}
+        prefix=names.get(result["layer_name"])
+        if prefix:
+            for suffix,value in [("SACIM_latency_stat",sparse),("baseline_latency_stat",dense)]:
+                attr=prefix+"_"+suffix;setattr(self,attr,getattr(self,attr)+value)
+        key=f"{result['phase']}:{result['layer_name']}_{result['layer_idx']}"
+        entry=self.per_layer_latency.setdefault(key,dict(layer_name=result['layer_name'],
+                  layer_idx=result['layer_idx'],phase=result['phase'],SACIM_latency=0.,baseline_latency=0.))
+        entry['SACIM_latency']+=sparse;entry['baseline_latency']+=dense
+        entry['speed_up']=entry['baseline_latency']/entry['SACIM_latency'] if entry['SACIM_latency']>0 else None
 
-        # # New unit/block sparsity statistic  #add
-        # 修复：恢复 unit sparsity 收集调用（原被注释导致非 bitnet 模型的
-        # unit_sparsity_summary.csv 永远为空）。保持原有条件：prefill 阶段跳过。
-        if not is_prefill:
-            self.collect_unit_sparsity(  #add
-                layer_name,  #add
-                layer_idx,  #add
-                activation,  #add
-                spec,  #add
-            )  #add
+    def export_cim_stats(self,path):
+        import json
+        from pathlib import Path
+        doc=dict(schema_version=1,bit_scope=self.bit_scope,geometry=self.cim_geometry,
+                 cycles_per_effective_bit=self.cycles_per_effective_bit,clock_freq_hz=self.clock_freq_hz,
+                 scope="activation-bit compute only; no hidden-one, exponent, sign beyond selected scope, IO or weight-update costs",
+                 records=self.cim_records)
+        destination=Path(path);destination.parent.mkdir(parents=True,exist_ok=True)
+        destination.write_text(json.dumps(doc,indent=2,allow_nan=False)+"\n")
+
+
+    def export_llmcompass_manifest(self,path,workload,source_commit):
+        """Export the current LLMCompass capacity-baseline bridge ratios.
+
+        This is one average per operator/phase, not a per-layer/context trace.
+        Missing operators, all-zero costs and unmatched GQA are rejected.
+        """
+        import json
+        from pathlib import Path
+        if self.as_l!=1: raise ValueError("LLMCompass import requires asynchronous mapping")
+        if not source_commit or not isinstance(workload,dict): raise ValueError("Provenance is required")
+        required={'d_model','ffn_dim','q_heads','kv_heads','batch_size','shared_kv_gqa',
+                  'prefill_lengths','decode_cache_lengths'}
+        if not required.issubset(workload): raise ValueError("Incomplete workload provenance")
+        d=workload['d_model'];q=workload['q_heads'];kv=workload['kv_heads'];ffn=workload['ffn_dim']
+        if min(d,q,kv,ffn,workload['batch_size'])<=0 or d%q or q%kv:
+            raise ValueError("Invalid model dimensions")
+        expected_shapes={'q_proj':(d,d),'k_proj':(d,d//q*kv),'v_proj':(d,d//q*kv),
+                         'o_proj':(d,d),'out_proj':(d,d),'gate_proj':(d,ffn),
+                         'up_proj':(d,ffn),'down_proj':(ffn,d)}
+        for r in self.cim_records:
+            if r['layer_name'] in expected_shapes:
+                if (r['in_features'],r['out_features'])!=expected_shapes[r['layer_name']]:
+                    raise ValueError("Projection dimensions differ from workload")
+        observed_prefill=sorted({r['operand_shape'][-2]//workload['batch_size']
+                                 for r in self.cim_records if r['phase']=='prefill' and r['layer_name']=='q_proj'})
+        observed_decode=sorted({r['out_features']-1 for r in self.cim_records
+                                if r['phase']=='decode' and r['layer_name']=='qk_matmul'})
+        if observed_prefill!=workload['prefill_lengths'] or observed_decode!=workload['decode_cache_lengths']:
+            raise ValueError("Observed prefill/decode contexts differ from workload")
+        names={"q_proj":"Q_proj","k_proj":"K_proj","v_proj":"V_proj",
+               "qk_matmul":"Q_mul_K","pv_matmul":"A_mul_V","o_proj":"H_matmul0",
+               "out_proj":"H_matmul0","gate_proj":"Gate_proj","up_proj":"Up_proj","down_proj":"Down_proj"}
+        speedups={};bits={}
+        for phase in ("prefill","decode"):
+            records=[r for r in self.cim_records if r['phase']==phase]
+            widths={r['dense_bits'] for r in records}
+            if len(widths)!=1: raise ValueError(f"{phase}: requires one dense bit width")
+            bits[phase]=widths.pop();totals={}
+            for r in records:
+                if r['layer_name'] not in names: continue
+                name=names[r['layer_name']]
+                if phase=='decode' and name in ('Q_mul_K','A_mul_V'):
+                    group=workload['q_heads']//workload['kv_heads'] if workload.get('shared_kv_gqa') else 1
+                    if r['operand_shape'][-2]!=group:
+                        raise ValueError("Decode attention grouping does not match shared-KV workload")
+                    operands=r['operand_shape'][0]*r['operand_shape'][1]
+                    expected=workload['batch_size']*(workload['kv_heads'] if workload.get('shared_kv_gqa') else workload['q_heads'])
+                    if operands!=expected: raise ValueError("Decode KV/Q operand count mismatch")
+                dense,sparse=totals.setdefault(name,[0.,0.])
+                totals[name]=[dense+r['llmcompass_dense_steps'],sparse+r['sparse_steps']]
+            if set(totals)!=set(names.values()): raise ValueError(f"{phase}: incomplete Qwen GEMM coverage")
+            if any(sparse<=0 for _,sparse in totals.values()):
+                raise ValueError("All-zero counted compute cannot be represented by a finite speedup")
+            speedups[phase]={name:dense/sparse for name,(dense,sparse) in totals.items()}
+        doc=dict(source_commit=source_commit,workload=workload,geometry=self.cim_geometry,
+                 baseline='effective',dense_bits=bits,cycles_per_effective_bit=self.cycles_per_effective_bit,
+                 activation_storage_bits=8,speedups=speedups,bit_scope=self.bit_scope,
+                 ratio_semantics="LLMCompass capacity denominator / measured mapped bit steps",
+                 approximation="one weighted operator average per phase; no layer/context trace",
+                 weight_format="INT4 must be configured separately for LLMCompass memory traffic")
+        destination=Path(path);destination.parent.mkdir(parents=True,exist_ok=True)
+        destination.write_text(json.dumps(doc,indent=2,allow_nan=False)+"\n")
 
     def _split_unit_layer_key(self, layer_key: str):  #add
         """  #add
@@ -2551,173 +2525,17 @@ class QuantStatManager:
                 f"(calls={call_counts.get(layer_key, 0)})"  #add
             )  #add
 
-    def collect_unit_sparsity(  #add
-        self,  #add
-        layer_name: str,  #add
-        layer_idx: int,  #add
-        activation: torch.Tensor,  #add
-        spec: QuantSpec,  #add
-    ):  #add
+    def collect_unit_sparsity(self,layer_name,layer_idx,activation,spec):
+        if not self.enable_unit_sparsity or activation is None or spec is None: return
+        zero,total=unit_sparse_counts(activation,spec,self.bit_scope,
+                                     self.unit_bit_group_size,self.unit_dim_group_size)
+        counter=self._get_unit_counter(self.current_phase,f"{layer_name}_{layer_idx}")
+        counter["zero_units"]+=zero;counter["total_units"]+=total
 
-        if not getattr(self, "enable_unit_sparsity", True):  #add
-            return  #add
 
-        if activation is None or spec is None:  #add
-            return  #add
+    def compute_unit_sparsity_int(self,tensor,bits,bit_group_size,dim_group_size,chunk_rows=2048):
+        return unit_sparse_counts(tensor,parse_quant_spec(bits),"storage",bit_group_size,dim_group_size,chunk_rows)
 
-        with torch.no_grad():  #add
-            phase = getattr(self, "current_phase", "full_forward")  #add
-            layer_key = f"{layer_name}_{layer_idx}"  #add
-
-            a = getattr(self, "unit_bit_group_size", 2)  #add
-            b = getattr(self, "unit_dim_group_size", 2)  #add
-
-            if spec.kind == "int":  #add
-                zero_units, total_units = self.compute_unit_sparsity_int(  #add
-                    activation,  #add
-                    bits=spec.bits,  #add
-                    bit_group_size=a,  #add
-                    dim_group_size=b,  #add
-                )  #add
-
-            elif spec.kind == "fp":  #add
-                zero_units, total_units = self.compute_unit_sparsity_fp(  #add
-                    activation,  #add
-                    fmt=spec.fmt,  #add
-                    bit_group_size=a,  #add
-                    dim_group_size=b,  #add
-                )  #add
-
-            elif spec.kind == "bf":  # BF16 也走 FP 统计路径
-                zero_units, total_units = self.compute_unit_sparsity_fp(  #add
-                    activation,  #add
-                    fmt=spec.fmt,  #add
-                    bit_group_size=a,  #add
-                    dim_group_size=b,  #add
-                )  #add
-
-            else:  #add
-                return  #add
-
-            counter = self._get_unit_counter(phase, layer_key)  #add
-            counter["zero_units"] += zero_units  #add
-            counter["total_units"] += total_units  #add
-
-    def compute_unit_sparsity_int(  #add
-        self,  #add
-        tensor: torch.Tensor,  #add
-        bits: int,  #add
-        bit_group_size: int,  #add
-        dim_group_size: int,  #add
-        chunk_rows: int = 4096,  #add
-    ):  #add
-        """  #add
-        INT activation unit sparsity (sign-magnitude representation).
-
-        输入 tensor 会被视为 [token_like, dim]：
-            token_like = 所有前置维度展平
-            dim        = 最后一维
-
-        每个 unit:
-            dim_group_size 个连续维度
-            bit_group_size 个连续 bit
-
-        unit 内所有 bit 为 0，则 zero_units += 1。
-
-        统计口径: sign-magnitude (原码)
-            先取绝对值得到 magnitude (bits-1 位)，再统计 bit。
-            符号位不参与统计。
-            例: INT8 -5 → |5| = 0000101 (7-bit magnitude)
-
-        注意：
-        这里不丢弃不能整除的部分。
-        如果 dim 不能被 dim_group_size 整除，则最后补 0 维度。
-        如果 magnitude bits 不能被 bit_group_size 整除，则高位补 0 到完整 group。
-        """  #add
-
-        if tensor is None or tensor.numel() == 0:  #add
-            return 0, 0  #add
-
-        if tensor.dim() == 1:  #add
-            x2d = tensor.detach().reshape(1, -1)  #add
-        else:  #add
-            x2d = tensor.detach().reshape(-1, tensor.shape[-1])  #add
-
-        rows, dim = x2d.shape  #add
-
-        # sign-magnitude: 只统计 magnitude (bits-1 位)，不含符号位
-        mag_bits = bits - 1  #add
-
-        padded_dim = ((dim + dim_group_size - 1) // dim_group_size) * dim_group_size  #add
-        padded_bits = ((mag_bits + bit_group_size - 1) // bit_group_size) * bit_group_size  #add
-
-        if padded_dim == 0 or padded_bits == 0:  #add
-            return 0, 0  #add
-
-        dim_pad = padded_dim - dim  #add
-
-        zero_units_total = 0  #add
-        total_units_total = 0  #add
-
-        amp_mask = (1 << mag_bits) - 1  #add
-
-        for row_start in range(0, rows, chunk_rows):  #add
-            row_end = min(row_start + chunk_rows, rows)  #add
-
-            chunk = x2d[row_start:row_end, :]  #add
-
-            # dim 方向 padding 0  #add
-            if dim_pad > 0:  #add
-                pad_tensor = torch.zeros(  #add
-                    chunk.shape[0],  #add
-                    dim_pad,  #add
-                    dtype=chunk.dtype,  #add
-                    device=chunk.device,  #add
-                )  #add
-                chunk = torch.cat([chunk, pad_tensor], dim=-1)  #add
-                del pad_tensor  #add
-
-            # sign-magnitude: 取绝对值，只保留 magnitude (不含符号位)  #add
-            # 例: INT8 -5 → abs(-5)=5 → 5 & 0x7F = 5 = 0000101  #add
-            mag_chunk = chunk.to(torch.int64).abs() & amp_mask  #add
-
-            # [R, padded_dim] -> [R, dim_groups, dim_group_size]  #add
-            grouped = mag_chunk.reshape(  #add
-                mag_chunk.shape[0],  #add
-                padded_dim // dim_group_size,  #add
-                dim_group_size,  #add
-            )  #add
-
-            for bit_start in range(0, padded_bits, bit_group_size):  #add
-                real_bit_end = min(bit_start + bit_group_size, mag_bits)  #add
-
-                if bit_start >= mag_bits:  #add
-                    # 全是 padding 0 bit → unit 全为 zero  #add
-                    unit_zero = torch.ones(  #add
-                        grouped.shape[0],  #add
-                        grouped.shape[1],  #add
-                        dtype=torch.bool,  #add
-                        device=grouped.device,  #add
-                    )  #add
-                else:  #add
-                    real_group_bits = real_bit_end - bit_start  #add
-                    bit_mask = ((1 << real_group_bits) - 1) << bit_start  #add
-
-                    selected_bits = grouped & bit_mask  #add
-
-                    unit_nonzero = selected_bits.ne(0).any(dim=-1)  #add
-                    unit_zero = ~unit_nonzero  #add
-
-                    del selected_bits, unit_nonzero  #add
-
-                zero_units_total += int(unit_zero.sum().item())  #add
-                total_units_total += int(unit_zero.numel())  #add
-
-                del unit_zero  #add
-
-            del chunk, mag_chunk, grouped  #add
-
-        return zero_units_total, total_units_total  #add
 
     def _fp_stat_width(self, fmt: str):  #add
         """Return mantissa-only bit width for unit sparsity (0MMM convention).
@@ -2745,232 +2563,14 @@ class QuantStatManager:
             f"Only E4M3, E5M10/FP16, and BF16 are supported."  #add
         )  #add
 
-    def compute_unit_sparsity_fp(  #add
-        self,  #add
-        tensor: torch.Tensor,  #add
-        fmt: str,  #add
-        bit_group_size: int,  #add
-        dim_group_size: int,  #add
-        chunk_rows: int = 2048,  #add
-    ):  #add
-        """  #add
-        FP activation unit sparsity.
+    def compute_unit_sparsity_fp(self,tensor,fmt,bit_group_size,dim_group_size,chunk_rows=2048):
+        return unit_sparse_counts(tensor,parse_quant_spec(fmt),self.bit_scope,bit_group_size,dim_group_size,chunk_rows)
 
-        先把 FP 激活转成 mantissa fixed integer：
-            E4M3  -> 19 bit
-            FP16  -> 42 bit
 
-        然后按 a-bit × b-dim 统计 unit zero ratio。
+    def compute_sparse_stats(self,n,tensor,th=0.0,chunk_size=1_048_576):
+        """Full n-bit two's-complement storage counts, including -8 in INT4."""
+        return sparse_counts(tensor,parse_quant_spec(n),"storage",th,chunk_size)
 
-        注意：
-        这里不丢弃不能整除的部分。
-        如果 bit 数不能被 bit_group_size 整除，则高位补 0 到完整 group。
-        如果 dim 不能被 dim_group_size 整除，则最后不足 b 个 dim 的 group 补 0。
-        """  #add
-
-        if tensor is None or tensor.numel() == 0:  #add
-            return 0, 0  #add
-
-        if tensor.dim() == 1:  #add
-            x2d = tensor.detach().reshape(1, -1)  #add
-        else:  #add
-            # 把除最后一维之外的所有维度都展平成 token_like 维度  #add
-            # 例如 [B, T, D] -> [B*T, D]  #add
-            x2d = tensor.detach().reshape(-1, tensor.shape[-1])  #add
-
-        rows, dim = x2d.shape  #add
-
-        stat_width = self._fp_stat_width(fmt)  #add
-
-        # ------------------------------------------------------------  #add
-        # 不再向下取整，而是向上补齐  #add
-        # ------------------------------------------------------------  #add
-        padded_dim = (  #add
-            (dim + dim_group_size - 1) // dim_group_size  #add
-        ) * dim_group_size  #add
-
-        padded_bits = (  #add
-            (stat_width + bit_group_size - 1) // bit_group_size  #add
-        ) * bit_group_size  #add
-
-        if padded_dim == 0 or padded_bits == 0:  #add
-            return 0, 0  #add
-
-        dim_pad = padded_dim - dim  #add
-
-        zero_units_total = 0  #add
-        total_units_total = 0  #add
-
-        for row_start in range(0, rows, chunk_rows):  #add
-            row_end = min(row_start + chunk_rows, rows)  #add
-
-            chunk = x2d[row_start:row_end, :]  #add
-
-            # --------------------------------------------------------  #add
-            # FP -> mantissa fixed integer  #add
-            # E4M3:  19-bit fixed mantissa  #add
-            # FP16:  42-bit fixed mantissa  #add
-            # --------------------------------------------------------  #add
-            fixed = self._fp_tensor_to_mantissa_fixed_chunk(  #add
-                chunk,  #add
-                fmt,  #add
-            )  #add
-
-            # --------------------------------------------------------  #add
-            # dim 方向 padding 0  #add
-            # 例如 dim=4097, b=2，则补 1 个 zero dim  #add
-            # 最后一组是 [真实 dim, padding zero]  #add
-            # --------------------------------------------------------  #add
-            if dim_pad > 0:  #add
-                pad_tensor = torch.zeros(  #add
-                    fixed.shape[0],  #add
-                    dim_pad,  #add
-                    dtype=fixed.dtype,  #add
-                    device=fixed.device,  #add
-                )  #add
-                fixed = torch.cat([fixed, pad_tensor], dim=-1)  #add
-                del pad_tensor  #add
-
-            # [R, padded_dim] -> [R, dim_groups, dim_group_size]  #add
-            grouped = fixed.reshape(  #add
-                fixed.shape[0],  #add
-                padded_dim // dim_group_size,  #add
-                dim_group_size,  #add
-            )  #add
-
-            # --------------------------------------------------------  #add
-            # bit 方向也不丢弃  #add
-            # 例如 FP8 stat_width=19, a=2:  #add
-            #   bit groups: [0:2], [2:4], ..., [18:20]  #add
-            # 最后一组只有 bit18 是真实 bit，bit19 相当于 padding 0  #add
-            # --------------------------------------------------------  #add
-            for bit_start in range(0, padded_bits, bit_group_size):  #add
-                real_bit_end = min(bit_start + bit_group_size, stat_width)  #add
-
-                # 如果 bit_start 已经超过真实 stat_width，说明这一组全是 padding 0。  #add
-                # 正常情况下 padded_bits 只会多补最后一组，不会出现很多全 padding 组。  #add
-                if bit_start >= stat_width:  #add
-                    unit_zero = torch.ones(  #add
-                        grouped.shape[0],  #add
-                        grouped.shape[1],  #add
-                        dtype=torch.bool,  #add
-                        device=grouped.device,  #add
-                    )  #add
-                else:  #add
-                    real_group_bits = real_bit_end - bit_start  #add
-                    bit_mask = ((1 << real_group_bits) - 1) << bit_start  #add
-
-                    selected_bits = grouped & bit_mask  #add
-
-                    # 一个 unit 覆盖：  #add
-                    #   dim_group_size 个维度  #add
-                    #   当前 bit group 的真实 bit + padding 0  #add
-                    # 如果这些真实 bit 全为 0，那么 padding bit 本来就是 0，unit 为 zero。  #add
-                    unit_nonzero = selected_bits.ne(0).any(dim=-1)  #add
-                    unit_zero = ~unit_nonzero  #add
-
-                    del selected_bits, unit_nonzero  #add
-
-                zero_units_total += int(unit_zero.sum().item())  #add
-                total_units_total += int(unit_zero.numel())  #add
-
-                del unit_zero  #add
-
-            del chunk, fixed, grouped  #add
-
-        return zero_units_total, total_units_total  #add
-
-    def compute_sparse_stats(
-        self,
-        n,
-        tensor,
-        th,
-        chunk_size: int = 1_048_576,  #add
-    ):
-        """
-        INT 量化激活的 chunked bit 统计。
-
-        返回:
-            total_num
-            abs_less_th
-            total_bits
-            zero_bits_total
-            sparse_bits_total
-            amplitude_zero_bits_total
-
-        amplitude_zero_bits_total:
-            使用 sign-magnitude/original-code 表示统计 0 bit。
-        """
-        total_num = tensor.numel()
-        mag_bits = n - 1  # 只统计数字位，不含符号位
-        total_bits = total_num * mag_bits
-
-        if total_num == 0:
-            return total_num, 0, total_bits, 0, 0, 0
-
-        # 原来是整张 tensor 一次性转换，8192 attention map 会产生巨大临时张量。 #delete
-        # abs_less_th = (torch.abs(tensor) <= th).sum().item()  #delete
-        # int_tensor = tensor.to(torch.int32)  #delete
-        # us_tensor = int_tensor & mask  #delete
-        # bit = (us_tensor >> i) & 1  #delete
-
-        flat = tensor.detach().reshape(-1)  #add
-
-        abs_less_th = 0  #add
-        zero_bits_total = 0
-        sparse_bits_total = 0
-        amplitude_zero_bits_total = 0
-
-        mask = (1 << n) - 1
-        amp_mask = (1 << (n - 1)) - 1
-        sign_bit = 1 << (n - 1)
-
-        for start in range(0, total_num, chunk_size):  #add
-            end = min(start + chunk_size, total_num)  #add
-            chunk = flat[start:end]  #add
-
-            abs_less_th += int((torch.abs(chunk) <= th).sum().item())  #add
-
-            int_tensor = chunk.to(torch.int32)  #add
-
-            # 补码低 n 位
-            us_tensor = int_tensor & mask  #add
-
-            # 正数 mask，包括 0
-            pos_mask = int_tensor >= 0  #add
-
-            # sign-magnitude / 原码
-            abs_val = torch.abs(int_tensor)  #add
-            neg_orig = sign_bit | (abs_val & amp_mask)  #add
-            orig_tensor = torch.where(pos_mask, us_tensor, neg_orig)  #add
-
-            for i in range(mag_bits):  # 只遍历数字位 [0, mag_bits-1]，跳过符号位
-                bit = (us_tensor >> i) & 1
-
-                zero_bits_total += int((1 - bit).sum().item())
-
-                sparse_contrib = torch.where(pos_mask, 1 - bit, bit)
-                sparse_bits_total += int(sparse_contrib.sum().item())
-
-                orig_bit = (orig_tensor >> i) & 1
-                amplitude_zero_bits_total += int((1 - orig_bit).sum().item())
-
-            del chunk, int_tensor, us_tensor, pos_mask, abs_val, neg_orig, orig_tensor  #add
-            if "bit" in locals():  #add
-                del bit  #add
-            if "sparse_contrib" in locals():  #add
-                del sparse_contrib  #add
-            if "orig_bit" in locals():  #add
-                del orig_bit  #add
-
-        return (
-            total_num,
-            abs_less_th,
-            total_bits,
-            zero_bits_total,
-            sparse_bits_total,
-            amplitude_zero_bits_total,
-        )
 
     def _get_fp_format(self, fmt: str):
         """
@@ -3039,119 +2639,9 @@ class QuantStatManager:
         sm_codes, _, _ = self._encode_fp_values_to_sm_exp(tensor_chunk, fmt)
         return sm_codes
 
-    def compute_sparse_stats_fp(
-        self,
-        fmt,
-        tensor,
-        th=0.0,
-        chunk_size: int = 1_048_576,  #add
-    ):
-        """
-        FP 输入的 chunked sparse/zero-bit 统计。
+    def compute_sparse_stats_fp(self,fmt,tensor,th=0.0,chunk_size=1_048_576):
+        return sparse_counts(tensor,parse_quant_spec(fmt),self.bit_scope,th,chunk_size)
 
-        当前统计语义:
-        1. FP 数值 -> 提取 explicit mantissa only (0MMM) 编码。
-        2. E4M3:
-             mantissa(3) = 3 bit (0MMM)，
-             按 3 bit 统计。
-        3. E5M10:
-             mantissa(10) = 10 bit (0MMM)，
-             按 10 bit 统计。
-
-        注意:
-        - 不再根据 exponent 把整个 FP 数值右移/左移。
-        - E4M3 的 total_bits = total_num * 3。
-        - E5M10 的 total_bits = total_num * 10。
-        """
-        info = self._get_fp_format(fmt)  #add
-        exp_bits = info["exp_bits"]  #add
-        mant_bits = info["mant_bits"]  #add
-
-        total_num = tensor.numel()  #add
-        max_num = tensor.abs().max().item()  #adds
-        max_exp = self._extract_exponent_from_scalar(max_num, fmt)
-        if total_num == 0:  #add
-            return total_num, 0, 0, 0, 0, 0  #add
-
-        flat = tensor.detach().reshape(-1)  #add
-
-        n = mant_bits  # 0MMM: mantissa bits only, no sign bit
-        total_bits = total_num * n  #add
-
-        if n >= 63:  #add
-            raise ValueError(  #add
-                f"FP mantissa statistic width n={n} is too large for int64 bit operations."  #add
-            )  #add
-
-        abs_less_th = 0  #add
-        zero_bits_total = 0  #add
-        sparse_bits_total = 0  #add
-        amplitude_zero_bits_total = 0  #add
-
-        for start in range(0, total_num, chunk_size):  #add
-            end = min(start + chunk_size, total_num)  #add
-            chunk = flat[start:end]  #add
-
-            # 避免 float8 / 特殊 dtype 上 abs_cuda 不支持。  #add
-            chunk_f32 = chunk.detach().to(torch.float32)  #add
-            chunk_f32 = torch.nan_to_num(chunk_f32, nan=0.0, posinf=0.0, neginf=0.0)  #add
-
-            abs_less_th += int((torch.abs(chunk_f32) <= th).sum().item())  #add
-
-            # 统一从 raw bit pattern 提取 sign+mantissa
-            fmt_lower = fmt.lower().strip()
-
-            if fmt_lower in {"e4m3", "fp8_e4m3", "float8_e4m3"}:
-                raw = chunk.to(torch.float8_e4m3fn).view(torch.uint8).reshape(-1).to(torch.int64)
-                sm_flat, n_bits, _ = self._extract_sm_from_raw(raw, "e4m3")
-            elif fmt_lower in {"e2m1", "fp4", "fp4_e2m1"}:
-                # FP4 fake quant 值映射到 E2M1 4-bit 编码
-                abs_v = chunk_f32.abs()
-                e2m1_code = torch.zeros_like(abs_v, dtype=torch.int64)
-                e2m1_code[abs_v >= 5.0] = 7
-                e2m1_code[(abs_v >= 3.5) & (abs_v < 5.0)] = 6
-                e2m1_code[(abs_v >= 2.5) & (abs_v < 3.5)] = 5
-                e2m1_code[(abs_v >= 1.75) & (abs_v < 2.5)] = 4
-                e2m1_code[(abs_v >= 1.25) & (abs_v < 1.75)] = 3
-                e2m1_code[(abs_v >= 0.75) & (abs_v < 1.25)] = 2
-                e2m1_code[(abs_v >= 0.25) & (abs_v < 0.75)] = 1
-                sign = (chunk_f32 < 0).to(torch.int64)
-                raw = (sign << 3) | e2m1_code  # 4-bit S E E M
-                sm_flat, n_bits, _ = self._extract_sm_from_raw(raw, "e2m1")
-            elif fmt_lower in {"e5m10", "fp16", "float16"}:
-                raw = chunk.detach().to(torch.float16).view(torch.int16).reshape(-1).to(torch.int64)
-                sm_flat, n_bits, _ = self._extract_sm_from_raw(raw, "e5m10")
-            elif fmt_lower in {"bf16"}:
-                raw = chunk.detach().to(torch.float16).view(torch.int16).reshape(-1).to(torch.int64)
-                sm_flat, n_bits, _ = self._extract_sm_from_raw(raw, "bf16")
-            else:
-                sm_flat = self._fp_tensor_to_mantissa_fixed_chunk(chunk, fmt).reshape(-1)
-                n_bits = n
-
-            for i in range(n_bits):  #add
-                bit = (sm_flat >> i) & 1  #add
-                zero_bit = 1 - bit  #add
-
-                bit_zero_count = int(zero_bit.sum().item())  #add
-
-                zero_bits_total += bit_zero_count  #add
-                sparse_bits_total += bit_zero_count  #add
-                amplitude_zero_bits_total += bit_zero_count  #add
-
-            del chunk, chunk_f32, sm_flat  #add
-            if "bit" in locals():  #add
-                del bit  #add
-            if "zero_bit" in locals():  #add
-                del zero_bit  #add
-
-        return (  #add
-            total_num,  #add
-            abs_less_th,  #add
-            total_bits,  #add
-            total_bits + max_exp * total_num,  #add
-            sparse_bits_total + max_exp * total_num,  #add
-            amplitude_zero_bits_total,  #add
-        )  #add
 
     def save_all_scales(self):
         """Save all collected scales to files."""

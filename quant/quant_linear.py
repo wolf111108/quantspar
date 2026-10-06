@@ -20,9 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 from typing import Optional, Tuple, Dict
-from utils import Round, LINEAR_SHIFT_NUM
-from others.hardware.HW_proxy.PAFCIM_proxy import PAFCIM_proxy
-from others.hardware.HW_proxy.Systolic_proxy import Systolic_HW_info, Systolic_proxy
+from .utils import Round, LINEAR_SHIFT_NUM
 
 
 from .quant_spec import (
@@ -72,7 +70,7 @@ class QuantizedLinear(nn.Linear):
         # 注意：这是用于构造论文所述 token-dependent precision workload 的
         # 自定义策略；论文没有规定这三档格式或比例。
         # -----------------------------------------------------------
-        mixed_precision: bool = True,
+        mixed_precision: bool = False,
         mp_high_ratio: float = 0.2,
         mp_low_ratio: float = 0.3,
         **kwargs
@@ -117,15 +115,15 @@ class QuantizedLinear(nn.Linear):
         self.o_interval: Optional[float] = None
 
         if self.a_spec.kind == "int":
-            self.a_qmax = 2 ** (self.a_bit - 1)
+            self.a_qmax = int_qmax(self.a_spec.bits)
         else:
             self.a_qmax = None
         if self.w_spec.kind == "int":
-            self.w_qmax = 2 ** (self.w_bit - 1)
+            self.w_qmax = int_qmax(self.w_spec.bits)
         else:
             self.w_qmax = None
         if self.o_spec.kind == "int":
-            self.o_qmax = 2 ** (self.o_bit - 1)
+            self.o_qmax = int_qmax(self.o_spec.bits)
         else:
             self.o_qmax = None
 
@@ -221,9 +219,11 @@ class QuantizedLinear(nn.Linear):
         out_features = self.out_features
 
         if HW == "Systolic":
+            from others.hardware.HW_proxy.Systolic_proxy import Systolic_HW_info, Systolic_proxy
             M, N, K = Systolic_HW_info()
             external_memory_accesses, compute_latency_ratio, latency_cycles = Systolic_proxy(M, N, K, x, self.weight)
         elif HW == "PAFCIM":
+            from others.hardware.HW_proxy.PAFCIM_proxy import PAFCIM_HW_info, PAFCIM_proxy
             M, N, K = PAFCIM_HW_info()
             external_memory_accesses, compute_latency_ratio, latency_cycles = PAFCIM_proxy(M, N, K, x, self.weight)
         else:
@@ -473,7 +473,7 @@ class QuantizedLinear(nn.Linear):
             self.o_interval = safe_scale_from_tensor(o_normal_fp, self.o_spec)
         else:
             self.a_interval = safe_scale_from_tensor(x, self.a_spec)
-            self.w_interval = safe_scale_from_tensor(self.weight, self.w_spec)
+            self.w_interval = self._weight_scale(self.weight)
             self.o_interval = safe_scale_from_tensor(out, self.o_spec)
 
             # Collect statistics if collector is provided
@@ -660,95 +660,32 @@ class QuantizedLinear(nn.Linear):
             return self._quant_forward_dynamic(x, stat_collector)
 
         if self.outlier_ratio > 0.0:
+            if stat_collector is not None:
+                raise ValueError("Mapped speedup does not include the outlier sidepath; use outlier_ratio=0")
             return self._quant_forward_with_outlier(x, stat_collector)
 
-        M0 = torch.tensor(
-            self.w_interval * self.a_interval / self.o_interval,
-            device=x.device,
-            dtype=torch.float32,
-        )
-        M0 = self.round(M0 * LINEAR_SHIFT_NUM)
-
-        x_code = quant_awo(
-            x,
-            self.a_interval,
-            self.a_spec,
-            out_dtype=x.dtype,
-            chunk_size=1_048_576,
-        )
-
-        w_code = quant_awo(
-            self.weight,
-            self.w_interval,
-            self.w_spec,
-            out_dtype=self.weight.dtype,
-            chunk_size=1_048_576,
-        )
-
-        if self.bias is not None:
-            bias_sim = self.quant_bias(self.bias)
-        else:
-            bias_sim = None
-
-        x_code = x_code.to(torch.float32)
-        w_code = w_code.to(torch.float32)
-
-
-        in_features = self.weight.size(1)
-        out_features = self.weight.size(0)
+        x_code = quant_awo(x, self.a_interval, self.a_spec, out_dtype=torch.float32)
+        w_code, w_deq = self._quantized_weight()
+        x_deq = x_code * self.a_interval
+        out_real = F.linear(x_deq, w_deq, self.bias.float() if self.bias is not None else None)
         if stat_collector is not None:
             stat_collector.collect_quant_activation(
-                self.layer_name,
-                self.layer_idx,
-                x_code,
-                x_code,
-                w_code,
-                self.w_spec,
-                self.a_spec,
-                self.digit_size,
-                self.parallelism,
-                in_features,
-                out_features
+                self.layer_name, self.layer_idx, x_code, x_code, w_code,
+                self.w_spec, self.a_spec, self.digit_size, self.parallelism,
+                self.in_features, self.out_features,
             )
+        return self._quantize_output_from_real(out_real, x.dtype)
 
-        if bias_sim is not None:
-            bias_code = bias_sim.to(torch.float32)
-        else:
-            bias_code = None
+    def _weight_scale(self, weight):
+        if self.weight_scale_granularity == "output_channel" and self.w_spec.enabled:
+            return safe_scale_per_token(weight.float(), self.w_spec).squeeze(-1)
+        return safe_scale_from_tensor(weight, self.w_spec)
 
-        acc_code = F.linear(x_code, w_code, bias_code)
-
-        scale_to_output = self.a_interval * self.w_interval / self.o_interval
-
-        if self.o_spec.kind == "int":
-            M0 = torch.tensor(scale_to_output, device=x.device, dtype=torch.float32)
-            M0 = self.round(M0 * LINEAR_SHIFT_NUM)
-
-            out_code = acc_code.mul(M0)
-            out_code = torch.div(
-                out_code,
-                LINEAR_SHIFT_NUM,
-                rounding_mode="floor",
-            )
-
-            out = out_code.mul(self.o_interval).to(x.dtype)
-            return out
-
-        if self.o_spec.kind == "fp" and self.o_spec.enabled:
-            out_scaled = acc_code.mul(scale_to_output)
-
-            dtype = fp8_dtype(self.o_spec.fmt)
-            max_val = fp8_max(self.o_spec.fmt)
-
-            out_code = out_scaled.clamp(-max_val, max_val).to(dtype).float()
-            out = out_code.mul(self.o_interval).to(x.dtype)
-            return out
-
-            out = out_code.mul(self.O_interval).to(A.dtype)  # add
-        # output 不量化
-        out = F.linear(x, self.weight, self.bias)
-
-        return out
+    def _quantized_weight(self):
+        scale = torch.as_tensor(self.w_interval,device=self.weight.device,dtype=torch.float32)
+        broadcast = scale[:,None] if scale.ndim == 1 else scale
+        codes = quant_awo(self.weight,broadcast,self.w_spec,out_dtype=torch.float32)
+        return codes, codes * broadcast
 
     def _mixed_precision_specs(self):
         """Return the three activation formats used by the synthetic MP policy.
@@ -906,18 +843,10 @@ class QuantizedLinear(nn.Linear):
         x_f32 = x.to(torch.float32)
         _, _, x_deq = self._quantize_activation_per_token(x_f32, self.a_spec)
 
-        self.w_interval = safe_scale_from_tensor(
-            self.weight.to(torch.float32), self.w_spec
-        )
-        w_code = quant_awo(
-            self.weight,
-            self.w_interval,
-            self.w_spec,
-            out_dtype=torch.float32,
-            chunk_size=1_048_576,
-        ).to(torch.float32)
+        self.w_interval = self._weight_scale(self.weight)
+        w_code, w_deq = self._quantized_weight()
 
-        out_real = F.linear(x_deq, w_code, bias=None) * self.w_interval
+        out_real = F.linear(x_deq, w_deq, bias=None)
         if self.bias is not None:
             out_real = out_real + self.bias.to(torch.float32)
 
@@ -950,15 +879,9 @@ class QuantizedLinear(nn.Linear):
             x.to(torch.float32), self.a_spec
         )
 
-        w_code = quant_awo(
-            self.weight,
-            self.w_interval,
-            self.w_spec,
-            out_dtype=torch.float32,
-            chunk_size=1_048_576,
-        ).to(torch.float32)
+        w_code, w_deq = self._quantized_weight()
 
-        out_real = F.linear(x_deq, w_code, bias=None) * self.w_interval
+        out_real = F.linear(x_deq, w_deq, bias=None)
         if self.bias is not None:
             out_real = out_real + self.bias.to(torch.float32)
 
@@ -968,6 +891,8 @@ class QuantizedLinear(nn.Linear):
                 self.layer_idx,
                 x_code,
                 x_code,
+                w_code,
+                self.w_spec,
                 self.a_spec,
                 self.digit_size,
                 self.parallelism,
@@ -1054,15 +979,9 @@ class QuantizedLinear(nn.Linear):
             code_all.index_copy_(0, indices, code)
             mp_codes.append((code, indices, spec))
 
-        w_code = quant_awo(
-            self.weight,
-            self.w_interval,
-            self.w_spec,
-            out_dtype=torch.float32,
-            chunk_size=1_048_576,
-        ).to(torch.float32)
+        w_code, w_deq = self._quantized_weight()
 
-        out_real = F.linear(x_deq_all, w_code, bias=None) * self.w_interval
+        out_real = F.linear(x_deq_all, w_deq, bias=None)
         if self.bias is not None:
             out_real = out_real + self.bias.to(torch.float32)
 
@@ -1122,7 +1041,7 @@ class QuantizedLinear(nn.Linear):
 
         out_real = F.linear(x, self.weight, self.bias)
 
-        self.w_interval = safe_scale_from_tensor(self.weight, self.w_spec)
+        self.w_interval = self._weight_scale(self.weight)
         self.o_interval = safe_scale_from_tensor(out_real, self.o_spec)
         self.a_interval = 0
 

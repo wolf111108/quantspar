@@ -11,19 +11,30 @@ import sys
 import argparse
 import torch
 import time
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import pickle
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from quant import load_config, QuantStatManager
-from quant.model_wrapper import wrap_model_by_family
-from quant.qwen_wrapper import switch_quantization_mode_all
-from others.data import CalibrationDataLoader
-from others.evaluation import evaluate_perplexity
-from tqdm import tqdm
 from quant.quant_linear import QuantizedLinear
 from quant.quant_matmul import QuantizedMatMul
+
+def _load_full_model_dependencies():
+    """The public snapshot lacks full-model wrappers/data modules; fail clearly."""
+    try:
+        from tqdm import tqdm
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from quant.model_wrapper import wrap_model_by_family
+        from quant.qwen_wrapper import switch_quantization_mode_all
+        from others.data import CalibrationDataLoader
+        from others.evaluation import evaluate_perplexity
+    except ImportError as exc:
+        raise RuntimeError(
+            "Full-model entry requires transformers, quant.model_wrapper, "
+            "quant.qwen_wrapper and others.data/evaluation from the complete project. "
+            "Use python -m scripts.profile_fp8_int4 for the self-contained core path."
+        ) from exc
+    globals().update({name:value for name,value in locals().items() if not name.startswith('_')})
 
 def enable_single_sample_inference_for_quantized_linear():
     def _is_single_sample_inference(self):
@@ -88,6 +99,8 @@ def parse_args():
         help="Skip evaluation after quantization"
     )
 
+    parser.add_argument("--stats-output-dir", type=str,
+                        help="fresh directory for prefill/decode CIM JSON statistics")
     parser.add_argument(
         "--text",
         type=str,
@@ -695,132 +708,13 @@ def evaluate(args, config, model):
 
 
     _sm = stat_manager_prefill
-    if _sm.latency>0:
-        # print(f"utilization: {_sm.ideal_sparsity_latency_stat/_sm.latency:.12f}")
-        # print(
-        #     f"IA value sparsity: "
-        #     f"{_sm.activation_zero_count / _sm.activation_element_count:.4%}"
-        # )
-        # print(
-        #     f"IA bit sparsity: "
-        #     f"{_sm.activation_0bit_count / _sm.activation_bit_count:.4%}"
-        #     f"{_sm.activation_sparsebit_count / _sm.activation_bit_count:.4%}"
-        #     f"{_sm.activation_amplitude_zero_bits_total / _sm.activation_bit_count:.4%}"
-        # )
-        # print(
-        #     f"shift 0 ratio: "
-        #     f"{_sm.shift_bit_0_count / _sm.shift_bit_total_count:.4%}"
-        # )
-        # print(
-        #     f"0 ratio: "
-        #     f"{_sm.activation_amplitude_zero_bits_total / _sm.activation_bit_count:.4%}"
-        # )
-
-        # print(
-        #     f"W value sparsity: "
-        #     f"{_sm.weight_zero_count / _sm.weight_element_count:.4%}"
-        # )
-        # print(
-        #     f"W bit sparsity: "
-        #     f"{_sm.weight_sparsebit_count / _sm.weight_bit_count:.4%}"
-        # )
-
-        # print(
-        #     f"KV value sparsity: "
-        #     f"{_sm.dynamic_weight_zero_count / _sm.dynamic_weight_element_count:.4%}"
-        # )
-        # print(
-        #     f"KV bit sparsity: "
-        #     f"{_sm.dynamic_weight_sparsebit_count / _sm.dynamic_weight_bit_count:.4%}"
-        # )
-
-
-        # if _sm.pv_count > 0 and _sm.pv_per_token_effective_one_bits_all is not None:
-        #     avg_per_token = _sm.pv_per_token_effective_one_bits_all.float() / _sm.pv_count
-        #     pv_pickle_path = os.path.join(config['quantization']['scale_dir'], 'pv_per_token_effective_one_bits_avg.p')
-        #     os.makedirs(os.path.dirname(pv_pickle_path), exist_ok=True)
-        #     with open(pv_pickle_path, 'wb') as f:
-        #         pickle.dump(avg_per_token.cpu(), f)
-        #     print(f"pv_per_token_effective_one_bits_avg saved to {pv_pickle_path}")
-        #     print(f"  shape: {avg_per_token.shape}, pv_count: {_sm.pv_count}")
-
-        # print(
-        #     f"pv_amplitude_zero_ratio: "
-        #     f"{_sm.pv_amplitude_zero_bits_all / _sm.pv_total_bits:.6f}"
-        # )
-
-        # print(
-        #     f"pv_amplitude_zero_ratio_no_causal: "
-        #     f"{_sm.pv_amplitude_zero_bits_no_causal / _sm.pv_total_bits:.6f}"
-        # )
-
-        matmul_latency = _sm.qk_matmul_SACIM_latency_stat + _sm.pv_matmul_SACIM_latency_stat
-        linear_latency = _sm.latency - matmul_latency
-
-        matmul_ideal_latency = _sm.qk_matmul_sparsity_speedup + _sm.pv_matmul_sparsity_speedup
-        linear_ideal_latency = _sm.ideal_sparsity_latency_stat - matmul_ideal_latency
-
-        print(f"qkv SACIM: {_sm.q_proj_SACIM_latency_stat:.12f} s")
-        print(f"qkv baseline: {_sm.q_proj_baseline_latency_stat:.12f} s")
-        print(f"qkv speedup: {_sm.q_proj_baseline_latency_stat/_sm.q_proj_SACIM_latency_stat:.12f}")
-        print(f"qkv TOPS: {Nop_q_proj_prefill/_sm.q_proj_SACIM_latency_stat:.12f}")
-
-        print(f"qk SACIM: {_sm.qk_matmul_SACIM_latency_stat:.12f} s")
-        print(f"qk baseline: {_sm.qk_matmul_baseline_latency_stat:.12f} s")
-        print(f"qk speedup: {_sm.qk_matmul_baseline_latency_stat/_sm.qk_matmul_SACIM_latency_stat:.12f}")
-        print(f"qk TOPS: {Nop_qk_matmul_prefill/_sm.qk_matmul_SACIM_latency_stat:.12f}")
-
-        print(f"pv SACIM: {_sm.pv_matmul_SACIM_latency_stat:.12f} s")
-        print(f"pv baseline: {_sm.pv_matmul_baseline_latency_stat:.12f} s")
-        print(f"pv speedup: {_sm.pv_matmul_baseline_latency_stat/_sm.pv_matmul_SACIM_latency_stat:.12f}")
-        print(f"pv TOPS: {Nop_pv_matmul_prefill/_sm.pv_matmul_SACIM_latency_stat:.12f}")
-
-
-        print(f"out SACIM: {_sm.o_proj_SACIM_latency_stat:.12f} s")
-        print(f"out baseline: {_sm.o_proj_baseline_latency_stat:.12f} s")
-        print(f"out speedup: {_sm.o_proj_baseline_latency_stat/_sm.o_proj_SACIM_latency_stat:.12f}")
-        print(f"out TOPS: {Nop_o_proj_prefill/_sm.o_proj_SACIM_latency_stat:.12f}")
-        if has_gate:
-            print(f"gate_proj SACIM: {_sm.gate_proj_SACIM_latency_stat:.12f} s")
-            print(f"gate_proj baseline: {_sm.gate_proj_baseline_latency_stat:.12f} s")
-            print(f"gate_proj speedup: {_sm.gate_proj_baseline_latency_stat/_sm.gate_proj_SACIM_latency_stat:.12f}")
-            print(f"gate_proj TOPS: {Nop_gate_proj_prefill/_sm.gate_proj_SACIM_latency_stat:.12f}")
-
-        print(f"up_proj SACIM: {_sm.up_proj_SACIM_latency_stat:.12f} s")
-        print(f"up_proj baseline: {_sm.up_proj_baseline_latency_stat:.12f} s")
-        print(f"up_proj speedup: {_sm.up_proj_baseline_latency_stat/_sm.up_proj_SACIM_latency_stat:.12f}")
-        print(f"up_proj TOPS: {Nop_up_proj_prefill / _sm.up_proj_SACIM_latency_stat:.12f} TOPS" if _sm.up_proj_SACIM_latency_stat > 0 else "up_proj TOPS: N/A")
-
-        print(f"down_proj SACIM: {_sm.down_proj_SACIM_latency_stat:.12f} s")
-        print(f"down_proj baseline: {_sm.down_proj_baseline_latency_stat:.12f} s")
-        print(f"down_proj speedup: {_sm.down_proj_baseline_latency_stat/_sm.down_proj_SACIM_latency_stat:.12f}")
-        print(f"down_proj TOPS: {Nop_down_proj_prefill / _sm.down_proj_SACIM_latency_stat:.12f} TOPS" if _sm.down_proj_SACIM_latency_stat > 0 else "down_proj TOPS: N/A")
-
-        print(f"-----------------all----------------------")
-
-        print(f"all SACIM: {_sm.latency:.12f} s")
-        print(f"ideal latency: {_sm.ideal_sparsity_latency_stat:.12f} s")
-        print(f"allflops baseline: {Nop_all_prefill:.12f} ")
-        print(f"TOPS: {Nop_all_prefill / _sm.latency:.12f} TOPS" if _sm.latency > 0 else "TOPS: N/A")
-        print(f"TOPS (ideal): {Nop_all_prefill / _sm.ideal_sparsity_latency_stat:.12f} TOPS" if _sm.ideal_sparsity_latency_stat > 0 else "TOPS (ideal): N/A")
-
-        print(f"-----------------linear----------------------")
-
-        print(f"linear SACIM: {linear_latency:.12f} s")
-        print(f"allflops baseline: {Nop_all_linear_prefill:.12f} ")
-        print(f"TOPS: {Nop_all_linear_prefill /linear_latency:.12f} TOPS" if linear_latency > 0 else "TOPS: N/A")
-        print(f"TOPS (ideal): {Nop_all_linear_prefill / linear_ideal_latency:.12f} TOPS" if linear_ideal_latency > 0 else "TOPS (ideal): N/A")
-
-        print(f"-----------------matmul----------------------")
-
-        print(f"matmul SACIM: {matmul_latency:.12f} s")
-        print(f"allflops baseline: {Nop_all_matmul_prefill:.12f} ")
-        print(f"TOPS: {Nop_all_matmul_prefill / matmul_latency:.12f} TOPS" if matmul_latency > 0 else "TOPS: N/A")
-        print(f"TOPS (ideal): {Nop_all_matmul_prefill / matmul_ideal_latency:.12f} TOPS" if matmul_ideal_latency > 0 else "TOPS (ideal): N/A")
-
-
-    else:
-        print("未收集到prefill激活统计数据")
+    destination=args.stats_output_dir or os.path.join(config['quantization']['scale_dir'],'cim_stats')
+    os.makedirs(destination,exist_ok=True)
+    for phase,manager in [('prefill',stat_manager_prefill),('decode',stat_manager_decode)]:
+        manager.export_cim_stats(os.path.join(destination,f'{phase}.json'))
+        sparse=manager.SACIM_latency_stat;dense=manager.baseline_latency_stat
+        speed=dense/sparse if sparse>0 else None
+        print(f"{phase}: counted-bit compute={sparse:.12f}s, dense={dense:.12f}s, mapped speedup={speed}")
 
 
     # # --------------------------------------------------------
@@ -893,10 +787,10 @@ def evaluate(args, config, model):
     # torch.cuda.empty_cache()
 
 def main():
-    f = open('log/hardware/hardware_profiling.log', 'w', encoding="utf-8")
 
     """Main entry point."""
     args = parse_args()
+    _load_full_model_dependencies()
     
     # Check if CUDA is available
     if args.device == "cuda" and not torch.cuda.is_available():

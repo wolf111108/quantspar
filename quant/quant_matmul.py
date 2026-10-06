@@ -68,7 +68,7 @@ class QuantizedMatMul(nn.Module):
         d_bit: Optional[int] = None,
         p: Optional[int] = None,
         outlier_ratio: float = 0.0,
-        mixed_precision: bool = True,
+        mixed_precision: bool = False,
         mp_high_ratio: float = 0.1,
         mp_low_ratio: float = 0.65,
     ):
@@ -465,131 +465,23 @@ class QuantizedMatMul(nn.Module):
                 A, B, stat_collector
             )
 
-        if self.layer_name == "pv_matmul":
-            pass
-
         if self.outlier_ratio > 0.0:
-             return self._quant_forward_with_outlier(A, B, stat_collector)
-
-        # M0 = torch.tensor(                                      # delete
-        #     self.A_interval * self.B_interval / self.O_interval,# delete
-        #     device=A.device,                                    # delete
-        #     dtype=torch.float32,                                # delete
-        # )                                                       # delete
-        # M0 = self.round(M0 * MATMUL_SHIFT_NUM)                  # delete
-
-        # A_sim = self.quant_input(A, self.A_interval, self.A_qmax).to(torch.float32)  # delete
-        # B_sim = self.quant_input(B, self.B_interval, self.B_qmax).to(torch.float32)  # delete
-
-        A_sim = quant_awo(       # add
-            A,                       # add
-            self.A_interval,         # add
-            self.A_spec,             # add
-            out_dtype=A.dtype,       # add
-            chunk_size=1_048_576,
-        )                            # add
-
-        B_sim = quant_awo(       # add
-            B,                       # add
-            self.B_interval,         # add
-            self.B_spec,             # add
-            out_dtype=B.dtype,       # add
-            chunk_size=1_048_576,
-        )                            # add
-
-        A_sim = A_sim.to(torch.float32)
-        B_sim = B_sim.to(torch.float32)
-
-        # 兼容 3D (OPT: [B*H, S, D]) 和 4D (Qwen: [B, H, S, D])
-        # matmul output's last dim = B's last dim (B is NOT [out,in] weight)
-        in_features = A.size(-1)
-        out_features = B.size(-1)
-
+            if stat_collector is not None:
+                raise ValueError("Mapped speedup does not include the outlier sidepath; use outlier_ratio=0")
+            return self._quant_forward_with_outlier(A, B, stat_collector)
+        A_code = quant_awo(A,self.A_interval,self.A_spec,out_dtype=torch.float32)
+        B_code = quant_awo(B,self.B_interval,self.B_spec,out_dtype=torch.float32)
         if stat_collector is not None:
             stat_collector.collect_quant_activation(
-                f"{self.layer_name}",  #add
-                self.layer_idx,
-                A_sim,
-                A,
-                B_sim,
-                self.B_spec,
-                self.A_spec,                                                    # add
-                self.digit_size,
-                self.parallelism,
-                in_features,
-                out_features
+                self.layer_name,self.layer_idx,A_code,A_code,B_code,self.B_spec,self.A_spec,
+                self.digit_size,self.parallelism,A.size(-1),B.size(-1),
             )
+        out_real = self._matmul(A_code*self.A_interval,B_code*self.B_interval)
+        if self.O_spec.enabled:
+            out_code = quant_awo(out_real,self.O_interval,self.O_spec,out_dtype=torch.float32)
+            out_real = out_code*self.O_interval
+        return out_real.to(A.dtype)
 
-        acc_code = self._matmul(A_sim, B_sim)  # add
-
-        scale_to_output = self.A_interval * self.B_interval / self.O_interval  # add
-
-        if self.O_spec.kind == "int":  # add
-            M0 = torch.tensor(         # add
-                scale_to_output,       # add
-                device=A.device,       # add
-                dtype=torch.float32,   # add
-            )                          # add
-            M0 = self.round(M0 * MATMUL_SHIFT_NUM)  # add
-
-            out_code = acc_code.mul(M0)             # add
-            out_code = torch.div(                   # add
-                out_code,                           # add
-                MATMUL_SHIFT_NUM,                   # add
-                rounding_mode="floor",              # add
-            )                                       # add
-
-            out = out_code.mul(self.O_interval).to(A.dtype)  # add
-
-        elif self.O_spec.kind == "fp":  # add
-            out_scaled = acc_code.mul(scale_to_output)          # add
-
-            dtype = fp8_dtype(self.O_spec.fmt)                  # add
-            max_val = fp8_max(self.O_spec.fmt)                  # add
-
-            out_code = out_scaled.clamp(-max_val, max_val).to(dtype).float()  # add
-            out = out_code.mul(self.O_interval).to(A.dtype)                  # add
-
-        elif self.O_spec.kind == "bf":  # add
-
-            M0 = torch.tensor(         # add
-                scale_to_output,       # add
-                device=A.device,       # add
-                dtype=torch.float32,   # add
-            )                          # add
-            M0 = self.round(M0 * MATMUL_SHIFT_NUM)  # add
-
-            out_code = acc_code.mul(M0)             # add
-            out_code = torch.div(                   # add
-                out_code,                           # add
-                MATMUL_SHIFT_NUM,                   # add
-                rounding_mode="floor",              # add
-            )                                       # add
-
-            out = out_code.mul(self.O_interval).to(A.dtype)  # add
-
-        else:  # add
-            out = self._matmul(A, B)  # add
-
-        # out_quant = self._matmul(A_sim, B_sim)                    # delete
-        # out_quant = out_quant.mul(M0)                             # delete
-        # out_quant = torch.div(                                    # delete
-        #     out_quant,                                            # delete
-        #     MATMUL_SHIFT_NUM,                                     # delete
-        #     rounding_mode="floor",                                # delete
-        # )                                                         # delete
-        # out = out_quant.mul(self.O_interval).to(A.dtype)          # delete
-        """"
-        with torch.no_grad():
-            out_ref = self._matmul(A, B)
-            mse = ((out - out_ref) ** 2).mean().item()
-            self.log_quant_error(
-                mse,
-                layer_name=self.layer_name,
-                layer_idx=self.layer_idx,
-            )
-        """
-        return out
 
     def _quant_forward_with_outlier(self, A, B, stat_collector=None):
         # """带 outlier 保护的量化前向计算。"""
