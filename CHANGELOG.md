@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-06 — Add joint Bitlet and BitWave profiling
+
+- 目的：让同一次 Qwen2.5-14B IA FP8 / Linear W INT4、2048＋256 实验同时采集 Bitlet 与 BitWave 的独立数据，避免重复校准和数值推理。
+- 内容：新增 BitWave collector、Mapping_stat_bitwave、SU1–SU6 候选映射、独立 trace/summary，以及 scripts.profile_bit_arches 共同入口、scripts.profile_bitwave 单独入口和共同 YAML；manager 将同一对量化张量分发给两者，runner 分别检查覆盖、输出检查点和关闭资源，生成 bit_arch_comparison.json。BitWave 默认参考原论文 512 BCE / 4096 SMM、250 MHz、两块 256 KiB SRAM、16x64-bit banks 与 SU 对应带宽；DRAM 速率未给出，保留 null，允许显式覆盖。采用非零 magnitude 列数量而非 Bitlet 的最大列 population，统计符号/索引/尾组及压缩开销；FP8 通过无损数值定点对齐和 signed INT8 分片进行分析，记录位宽扩展，禁止 Bit-Flip 改变共同输入。片外仍按紧凑 W4 / FP8 KV 计量，BCS 压缩单独诊断；auto 按估计计算及 streaming SRAM 读量选择 SU。既有离线剩余成本入口扩展接受 BitWave，并统一浮点相加顺序；更新使用说明与 README。
+- 验证：真实 PyTorch 2.6.0+cpu、Transformers 4.43.1 下 49 项测试通过（42 项原有＋7 项 BitWave）。独立 Python 标量参考验证六种 SU、Linear/attention、整数/FP8 对齐、宽 B、K/N 尾组；检查 INT4 -8、符号、hidden one、INT8 -128、A 零值不免费跳过、抽样复现/chunk 不变性、SU 选择与 SRAM 容量拒绝、索引压缩、DRAM 空缺与显式流量。真实保存/加载小型 Qwen：共同运行一次校准＋一次 prefill＋两次 decode 共四次 forward；两个 collector 各 9＋18 调用，单独与共同统计相同；teacher-forced/greedy CLI、GQA、cache、E2E 补成本、故障中断与两个 trace 关闭通过。旧 EBB/Bitlet/Asyn 回归通过。
+- 限制与旧结果影响：未运行完整 14B、CUDA、PPL 或 RTL。BitWave 原文为整数引擎，没有原生 FP8 Qwen 实测；定点 scale、分片累加、FP8 metadata、转换与控制成本属于显式扩展，auto 搜索不是 ZigZag，抽样选择也存在估计误差/选择偏差。SRAM 检查只覆盖一个 tile，不模拟完整 reuse、register traffic 或 spill；未填 DRAM 速率时不产生 GEMM/IO 总时间或 E2E，搬运情景也不是物理保证上下界。共同配置的量化/scale 路径与 Bitlet 单独配置一致，可以在确认匹配后复用；Bitlet 周期/搬运公式与旧 EBB/Asyn 公式保持不变，单独入口保留；compute 加速比来自各自 dense 布局，不等同于跨架构 E2E 倍率。统计增加运行时间和 trace 大小。
+
 ## 2026-10-06 — Add paper-configured Bitlet profiling and latency scenarios
 
 - 目的：为 Qwen2.5-14B IA FP8 / Linear W INT4、2048 prefill＋256 decode 获取 Bitlet BCE 所需的实际列负载，并提供依据原论文硬件参数的独立 GEMM/搬运时延估计。

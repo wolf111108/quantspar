@@ -39,10 +39,22 @@ def transformers_version_tuple(raw):
     return tuple(parts)
 
 
+def requested_architectures(backend):
+    if backend == "bitlet_bitwave":
+        return ("bitlet", "bitwave")
+    if backend in ("ebb", "bitlet", "bitwave"):
+        return (backend,)
+    raise ValueError("Unsupported profiling backend")
+
+
 def parse_args(argv=None, backend="ebb"):
+    architectures = requested_architectures(backend)
     parser = argparse.ArgumentParser(description=(
-        "Local Qwen FP8/W4 Bitlet column and latency collection." if backend == "bitlet" else __doc__))
-    default_config = ("config/qwen2_14b_bitlet_f8i4_2048_256.yaml" if backend == "bitlet"
+        "One Qwen FP8/W4 inference pass with separate Bitlet/BitWave collectors."
+        if backend == "bitlet_bitwave" else f"Local Qwen FP8/W4 {backend} collection."))
+    default_config = ("config/qwen2_14b_bitlet_bitwave_f8i4_2048_256.yaml"
+                      if "bitwave" in architectures else
+                      "config/qwen2_14b_bitlet_f8i4_2048_256.yaml" if backend == "bitlet"
                       else "config/qwen2_14b_ebb_f8i4.yaml")
     parser.add_argument("--config", type=Path, default=Path(default_config))
     parser.add_argument("--model-path", required=True)
@@ -60,14 +72,18 @@ def parse_args(argv=None, backend="ebb"):
                         help="torch.save LongTensor [tokens], or dict with input_ids; no dataset needed")
     parser.add_argument("--greedy-decode", action="store_true",
                         help="generate tokens; default uses teacher-forced tokens from the document")
-    if backend == "bitlet":
-        parser.add_argument("--exact", action="store_true", help="Enumerate every BCE tile (expensive for 14B)")
+    if backend != "ebb":
+        parser.add_argument("--exact", action="store_true", help="Enumerate all tiles in every requested collector")
         parser.add_argument("--prefill-sample-waves", type=int,
                             help="Uniform waves per operand/call; 0 means exact")
         parser.add_argument("--decode-sample-waves", type=int,
                             help="Uniform waves per operand/call; 0 means exact")
         parser.add_argument("--other-latency-json", type=Path,
                             help="Remaining operator latency including LM head, in seconds")
+    if "bitwave" in architectures:
+        parser.add_argument("--bitwave-dram-bandwidth-gbps", type=float,
+                            help="Explicit DRAM bandwidth assumption, decimal GB/s; paper does not specify it")
+        parser.add_argument("--bitwave-dataflow", choices=("auto", "SU1", "SU2", "SU3", "SU4", "SU5", "SU6"))
     return parser.parse_args(argv)
 
 
@@ -91,7 +107,11 @@ def resolve_workload(config, args):
 
 
 def validate_config(config, backend="ebb"):
-    label = "Bitlet" if backend == "bitlet" else "EBB"
+    if backend == "bitlet_bitwave":
+        for name in requested_architectures(backend):
+            validate_config(config, name)
+        return
+    label = backend.capitalize()
     if not config.get(backend, {}).get("enabled", True):
         raise ValueError(f"profile_{backend} requires the {label} backend to be enabled")
     quant = config["quantization"]
@@ -114,6 +134,9 @@ def validate_config(config, backend="ebb"):
     if backend == "bitlet":
         from quant.bitlet import BitletConfig
         BitletConfig.from_dict(config["bitlet"])
+    elif backend == "bitwave":
+        from quant.bitwave import BitWaveConfig
+        BitWaveConfig.from_dict(config["bitwave"])
     else:
         from quant.ebb import EBBConfig
         EBBConfig.from_dict(config["ebb"])
@@ -164,20 +187,25 @@ def profile_tokens(args, config, tokenizer, prefill, decode):
 
 
 def main(argv=None, *, backend="ebb"):
-    if backend not in ("ebb", "bitlet"):
-        raise ValueError("Unsupported profiling backend")
+    architectures = requested_architectures(backend)
     args = parse_args(argv, backend)
     config = deepcopy(load_config(args.config))
     if args.scale_dir is not None:
         config["quantization"]["scale_dir"] = str(args.scale_dir)
     other_latency = None
-    if backend == "bitlet":
+    if backend != "ebb":
         if args.exact and (args.prefill_sample_waves is not None or args.decode_sample_waves is not None):
             raise ValueError("--exact cannot be combined with sample wave overrides")
-        for phase in ("prefill", "decode"):
-            value = 0 if args.exact else getattr(args, f"{phase}_sample_waves")
-            if value is not None:
-                config["bitlet"][f"{phase}_sample_waves"] = value
+        for name in architectures:
+            for phase in ("prefill", "decode"):
+                value = 0 if args.exact else getattr(args, f"{phase}_sample_waves")
+                if value is not None:
+                    config[name][f"{phase}_sample_waves"] = value
+        if "bitwave" in architectures:
+            if args.bitwave_dram_bandwidth_gbps is not None:
+                config["bitwave"]["dram_bytes_per_second"] = args.bitwave_dram_bandwidth_gbps*1e9
+            if args.bitwave_dataflow is not None:
+                config["bitwave"]["dataflow"] = args.bitwave_dataflow
         if args.other_latency_json:
             other_latency = json.loads(args.other_latency_json.read_text())
     validate_config(config, backend)
@@ -237,14 +265,30 @@ def main(argv=None, *, backend="ebb"):
                 calibration_batches += 1
         calibration_manager.save_all_scales()
     switch_quantization_mode_all(model, "quant_forward")
-    backend_config = dict(config[backend], trace_path=str(args.output_dir / f"{backend}_trace.jsonl"))
-    manager = QuantStatManager(scale_dir, **{f"{backend}_config": backend_config})
-    collector = getattr(manager, f"{backend}_stats")
+    backend_configs = {f"{name}_config": dict(
+        config[name], trace_path=str(args.output_dir / f"{name}_trace.jsonl"))
+        for name in architectures}
+    manager = QuantStatManager(scale_dir, **backend_configs)
+    collectors = {name: getattr(manager, f"{name}_stats") for name in architectures}
     def export_stats(workload):
-        path = args.output_dir / f"{backend}_summary.json"
-        if backend == "bitlet":
-            return manager.export_bitlet_stats(path, workload, other_latency)
-        return manager.export_ebb_stats(path, workload)
+        documents = {}
+        for name in architectures:
+            path = args.output_dir / f"{name}_summary.json"
+            export = getattr(manager, f"export_{name}_stats")
+            documents[name] = (export(path, workload) if name == "ebb"
+                               else export(path, workload, other_latency))
+        if len(documents) > 1:
+            comparison = dict(schema_version=1, workload=workload,
+                shared_quantized_operands=True,
+                architectures={name: dict(
+                    summary_file=f"{name}_summary.json",
+                    mapped_compute_speedups=doc["mapped_compute_speedups"],
+                    latency=doc["latency"],
+                    calls_by_phase={phase: value["calls"] for phase, value in doc["phases"].items()})
+                    for name, doc in documents.items()})
+            (args.output_dir/"bit_arch_comparison.json").write_text(
+                json.dumps(comparison, indent=2, allow_nan=False)+"\n")
+        return documents
     bind_manager(model, manager)
     workload = dict(model_type=model.config.model_type, layers=len(model.model.layers),
                     d_model=model.config.hidden_size, ffn_dim=model.config.intermediate_size,
@@ -258,10 +302,11 @@ def main(argv=None, *, backend="ebb"):
                                      completed_batches=calibration_batches,
                                      operators_recalibrated=actions.count("recalibrate"),
                                      operators_reused=actions.count("reuse")),
-                    quantization=quant, profile_backend=backend, source_commit=source_git_commit())
+                    quantization=quant, profile_backend=backend,
+                    profile_architectures=list(architectures), source_commit=source_git_commit())
     workload.update(status="running", completed_decode_steps=0)
     (args.output_dir / "run_config.json").write_text(json.dumps(
-        dict(workload=workload, **{backend: config[backend]}), indent=2) + "\n")
+        dict(workload=workload, **{name: config[name] for name in architectures}), indent=2) + "\n")
     try:
         with torch.no_grad():
             manager.set_phase("prefill")
@@ -269,10 +314,11 @@ def main(argv=None, *, backend="ebb"):
             output = model.model(tokens[:prefill].unsqueeze(0).to(args.device),
                                  past_key_values=DynamicCache(), use_cache=True)
             past = output.past_key_values
-            if collector.phases["prefill"]["calls"] != expected:
-                raise RuntimeError("Incomplete prefill operator coverage")
-            if backend == "bitlet":
-                collector.validate_coverage(len(model.model.layers))
+            for name, collector in collectors.items():
+                if collector.phases["prefill"]["calls"] != expected:
+                    raise RuntimeError(f"{name}: incomplete prefill operator coverage")
+                if name != "ebb":
+                    collector.validate_coverage(len(model.model.layers))
             export_stats(workload)
             manager.set_phase("decode")
             from tqdm import trange
@@ -289,10 +335,11 @@ def main(argv=None, *, backend="ebb"):
                 workload["completed_decode_steps"] = step + 1
                 if (step + 1) % args.checkpoint_every == 0:
                     export_stats(workload)
-            if decode and collector.phases["decode"]["calls"] != expected * decode:
-                raise RuntimeError("Incomplete decode operator coverage")
-            if backend == "bitlet":
-                collector.validate_coverage(len(model.model.layers), decode)
+            for name, collector in collectors.items():
+                if decode and collector.phases["decode"]["calls"] != expected * decode:
+                    raise RuntimeError(f"{name}: incomplete decode operator coverage")
+                if name != "ebb":
+                    collector.validate_coverage(len(model.model.layers), decode)
             workload["status"] = "complete"
             doc = export_stats(workload)
     except BaseException:
@@ -301,18 +348,24 @@ def main(argv=None, *, backend="ebb"):
         raise
     finally:
         manager.close()
-    for phase, result in doc["phases"].items():
-        if backend == "bitlet":
-            seconds = result["latency"]
-            print(f"{phase}: Bitlet GEMM/IO scenarios "
-                  f"{seconds['resident_full_overlap_seconds']:.6f}.."
-                  f"{seconds['streaming_no_overlap_seconds']:.6f} s; "
-                  f"sampled calls={result['sampled_calls']}; excludes unsupplied remaining operators")
-        else:
-            seconds = result["compute_seconds"]
-            print(f"{phase}: conditional compute bounds "
-                  f"{seconds['ideal_balanced']:.6f}..{seconds['leading_zero']:.6f} s; "
-                  f"word coverage complete={result['configured_word_coverage_complete']}")
+    for name, document in doc.items():
+        for phase, result in document["phases"].items():
+            if name == "bitlet":
+                seconds = result["latency"]
+                print(f"{phase}: Bitlet GEMM/IO scenarios "
+                      f"{seconds['resident_full_overlap_seconds']:.6f}.."
+                      f"{seconds['streaming_no_overlap_seconds']:.6f} s; "
+                      f"sampled calls={result['sampled_calls']}; excludes unsupplied remaining operators")
+            elif name == "bitwave":
+                seconds = result["latency"]
+                print(f"{phase}: BitWave conditional slice compute "
+                      f"{seconds['mapped_compute_seconds']:.6f} s; sampled calls={result['sampled_calls']}; "
+                      f"DRAM bandwidth supplied={document['latency']['dram_bandwidth_supplied']}")
+            else:
+                seconds = result["compute_seconds"]
+                print(f"{phase}: conditional compute bounds "
+                      f"{seconds['ideal_balanced']:.6f}..{seconds['leading_zero']:.6f} s; "
+                      f"word coverage complete={result['configured_word_coverage_complete']}")
     print(f"Results: {args.output_dir}")
 
 

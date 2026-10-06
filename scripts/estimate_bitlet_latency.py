@@ -1,4 +1,4 @@
-"""Add remaining operator latencies to an existing Bitlet summary without rerunning Qwen."""
+"""Add remaining latencies to a Bitlet/BitWave summary without rerunning Qwen."""
 import argparse
 import json
 from pathlib import Path
@@ -7,23 +7,26 @@ from quant.bitlet import validate_other_latency
 
 
 def estimate(summary, other):
-    if summary.get("backend") != "bitlet" or summary.get("schema_version") != 1:
-        raise ValueError("Input must be a Bitlet schema_version=1 summary")
+    if summary.get("backend") not in ("bitlet", "bitwave") or summary.get("schema_version") != 1:
+        raise ValueError("Input must be a Bitlet/BitWave schema_version=1 summary")
     workload = summary["workload"]
     if workload.get("status") != "complete" or not summary["latency"]["collection_complete"]:
         raise ValueError("Complete profiling is required before adding E2E costs")
     validate_other_latency(other, workload["decode_steps"])
-    extra = other["prefill_seconds"]+sum(other["decode_step_seconds"])
+    prefill_other = other["prefill_seconds"]
+    decode_other = sum(other["decode_step_seconds"])
     modeled = summary["latency"]["gemm_and_io_seconds"]
-    e2e = {key: value+extra for key, value in modeled.items()}
+    if modeled is None:
+        raise ValueError("GEMM/IO estimate is unavailable; supply BitWave DRAM bandwidth during collection")
+    e2e = {key: value+prefill_other+decode_other for key, value in modeled.items()}
     decode = summary["latency"]["per_phase_seconds"].get("decode", {})
-    return dict(schema_version=1, backend="bitlet", source_commit=workload.get("source_commit"),
+    return dict(schema_version=1, backend=summary["backend"], source_commit=workload.get("source_commit"),
                 workload=workload, config=summary["config"],
                 scope="conditional E2E scenarios with supplied remaining operators; not measured hardware latency",
                 gemm_and_io_seconds=modeled, supplied_other_latency=other,
                 conditional_e2e_seconds=e2e,
                 average_decode_seconds=(
-                    {key: (value+sum(other["decode_step_seconds"]))/workload["decode_steps"]
+                    {key: (value+decode_other)/workload["decode_steps"]
                      for key, value in decode.items()} if workload["decode_steps"] else None),
                 assumptions=summary["assumptions"])
 

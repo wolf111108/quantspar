@@ -1,5 +1,12 @@
 from dataclasses import dataclass
 
+def Mapping_stat_bitwave(activation, weight, a_spec, b_spec, in_features,
+                         out_features, config, phase="prefill", seed=None):
+    """BitWave nonzero B columns with Table-I spatial unrolling."""
+    from .bitwave import measure_bitwave_mapping
+    return measure_bitwave_mapping(activation, weight, a_spec, b_spec, in_features,
+                                   out_features, config, phase, seed)
+
 def Mapping_stat_bitlet(activation, weight, a_spec, b_spec, in_features,
                         out_features, config, phase="prefill", seed=None):
     """Bitlet BCE column work; independent of Asyn-CIM and EBB ratios."""

@@ -1,0 +1,143 @@
+# One model pass, two independent collectors; quantization/scales match Bitlet-only.
+# BitWave: HPCA 2024 Table I/Fig.11/Sec.V-A; DRAM speed is not specified.
+model:
+  name: qwen2.5-14b
+  family: qwen2
+  path: models/Qwen2.5-14B
+  num_layers: 48
+  attn_implementation: eager
+quantization:
+  enabled: true
+  mode: quant_forward
+  model_family: qwen2
+  quantize_linear: true
+  quantize_matmul: true
+  scale_dir: quant/scales/qwen2_14b_bitlet_f8i4_2048/
+  calibration_policy:
+    default: auto
+  q_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  k_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  v_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  o_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  gate_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  up_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  down_proj:
+    a_bit: e4m3
+    w_bit: 4
+    o_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  qk_matmul:
+    A_bit: e4m3
+    B_bit: e4m3
+    O_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  pv_matmul:
+    A_bit: e4m3
+    B_bit: e4m3
+    O_bit: e4m3
+    d_bit: e4m3
+    outlier_ratio: 0.0
+    p: 4
+  lm_head:
+    enabled: false
+  mixed_precision: false
+  dynamic_activation: false
+  weight_scale_granularity: scalar
+  shared_kv_gqa: true
+  kv_cache:
+    fp8_static: true
+calibration:
+  dataset: HuggingFaceFW/fineweb
+  dataset_config: sample-10BT
+  split: train
+  streaming: true
+  text_column: text
+  min_text_tokens: 2048
+  num_samples: 64
+  seq_length: 2048
+  batch_size: 1
+  seed: 23
+prefill_decode_profile:
+  enabled: true
+  prefill_length: 2048
+  decode_steps: 256
+  dataset: HuggingFaceFW/fineweb
+  dataset_config: sample-10BT
+  split: train
+  streaming: true
+  text_column: text
+  sample_offset: 0
+  start_offset: 0
+bitlet:
+  enabled: true
+  pe_count: 32
+  group_size: 64
+  frequency_hz: 1000000000.0
+  mantissa_bits: 24
+  activation_dma_bytes_per_second: 12800000000.0
+  weight_dma_bytes_per_second: 12800000000.0
+  local_buffer_bytes_per_second: 25600000000.0
+  local_buffer_bytes: null
+  output_storage_bytes: 2
+  group_setup_cycles: 0
+  prefill_sample_waves: 64
+  decode_sample_waves: 8
+  chunk_waves: 8
+  sample_seed: 23
+bitwave:
+  enabled: true
+  bce_count: 512
+  frequency_hz: 250000000.0
+  activation_sram_bytes: 262144
+  weight_sram_bytes: 262144
+  sram_banks: 16
+  sram_bank_bits: 64
+  dram_bytes_per_second: null
+  dataflow: auto
+  output_storage_bytes: 2
+  group_setup_cycles: 0
+  prefill_sample_waves: 64
+  decode_sample_waves: 8
+  chunk_waves: 4
+  sample_seed: 23
+  bit_flip: false

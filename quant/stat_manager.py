@@ -142,7 +142,7 @@ class QuantStatManager:
     def __init__(self, scale_dir: str, nmacro: int = 32, as_l: int = 1, *,
                  h: int = 64, w: int = 48, banks: int = 16,
                  bit_scope: str = "mantissa", cycles_per_effective_bit: float = 1,
-                 ebb_config=None, bitlet_config=None):
+                 ebb_config=None, bitlet_config=None, bitwave_config=None):
         """
         Initialize statistics manager.
 
@@ -164,11 +164,13 @@ class QuantStatManager:
         self.cim_records = []
         self.ebb_stats = None
         self.bitlet_stats = None
+        self.bitwave_stats = None
         self.execution_context = {}
         self.attention_context = {}
-        if (ebb_config is not None and ebb_config.get("enabled", True) and
-                bitlet_config is not None and bitlet_config.get("enabled", True)):
-            raise ValueError("Enable only one architecture collector per run")
+        if (ebb_config is not None and ebb_config.get("enabled", True) and any(
+                value is not None and value.get("enabled", True)
+                for value in (bitlet_config, bitwave_config))):
+            raise ValueError("EBB collection is separate from Bitlet/BitWave collection")
         if ebb_config is not None and ebb_config.get("enabled", True):
             from .ebb import EBBConfig, EBBStats
             self.ebb_stats = EBBStats(EBBConfig.from_dict(ebb_config), ebb_config.get("trace_path"))
@@ -176,6 +178,15 @@ class QuantStatManager:
             from .bitlet import BitletConfig, BitletStats
             self.bitlet_stats = BitletStats(BitletConfig.from_dict(bitlet_config),
                                             bitlet_config.get("trace_path"))
+        if bitwave_config is not None and bitwave_config.get("enabled", True):
+            from .bitwave import BitWaveConfig, BitWaveStats
+            self.bitwave_stats = BitWaveStats(BitWaveConfig.from_dict(bitwave_config),
+                                              bitwave_config.get("trace_path"))
+        self.bit_architecture_collectors = {
+            name: collector for name, collector in (
+                ("bitlet", self.bitlet_stats), ("bitwave", self.bitwave_stats))
+            if collector is not None
+        }
         self._static_weights_seen = set()
         self.stats: Dict[str, QuantStatistics] = {}
         self.hooks: List[Any] = []
@@ -376,14 +387,21 @@ class QuantStatManager:
             raise ValueError("Bitlet backend is not enabled")
         return self.bitlet_stats.export(path, workload, other_latency)
 
+    def export_bitwave_stats(self, path, workload=None, other_latency=None):
+        if self.bitwave_stats is None:
+            raise ValueError("BitWave backend is not enabled")
+        return self.bitwave_stats.export(path, workload, other_latency)
+
     def close(self):
         if self.ebb_stats is not None:
             self.ebb_stats.close()
         if self.bitlet_stats is not None:
             self.bitlet_stats.close()
+        if self.bitwave_stats is not None:
+            self.bitwave_stats.close()
 
     def reset_sparsity(self):  #add
-        if self.ebb_stats is not None or self.bitlet_stats is not None:
+        if self.ebb_stats is not None or self.bit_architecture_collectors:
             raise ValueError("Use a new architecture manager per run; reset would invalidate streamed trace")
         self.cim_records.clear();self._static_weights_seen.clear();self.per_layer_latency.clear()
         for prefix in ('activation','weight','dynamic_weight'):
@@ -2278,12 +2296,14 @@ class QuantStatManager:
                                  weight,weight_spec,spec,digit_size,parallelism,
                                  in_features,out_features):
         if activation is None or spec is None or spec.kind == "none": return
-        if self.bitlet_stats is not None:
+        if self.bit_architecture_collectors:
             context = dict(self.execution_context)
             context.update(self.attention_context.get((layer_name, layer_idx), {}))
-            return self.bitlet_stats.collect(layer_name, layer_idx, activation, weight,
-                                             spec, weight_spec, in_features, out_features,
-                                             self.current_phase, context)
+            records = {name: collector.collect(
+                layer_name, layer_idx, activation, weight, spec, weight_spec,
+                in_features, out_features, self.current_phase, context)
+                for name, collector in self.bit_architecture_collectors.items()}
+            return next(iter(records.values())) if len(records) == 1 else records
         if self.ebb_stats is not None:
             context = dict(self.execution_context)
             context.update(self.attention_context.get((layer_name, layer_idx), {}))
@@ -2336,7 +2356,7 @@ class QuantStatManager:
         entry['speed_up']=entry['baseline_latency']/entry['SACIM_latency'] if entry['SACIM_latency']>0 else None
 
     def export_cim_stats(self,path):
-        if self.ebb_stats is not None or self.bitlet_stats is not None:
+        if self.ebb_stats is not None or self.bit_architecture_collectors:
             raise ValueError("Architecture results require their own export, not the Asyn-CIM schema")
         import json
         from pathlib import Path
@@ -2354,7 +2374,7 @@ class QuantStatManager:
         This is one average per operator/phase, not a per-layer/context trace.
         Missing operators, all-zero costs and unmatched GQA are rejected.
         """
-        if self.ebb_stats is not None or self.bitlet_stats is not None:
+        if self.ebb_stats is not None or self.bit_architecture_collectors:
             raise ValueError("The Asyn-CIM LLMCompass bridge cannot import other architectures")
         import json
         from pathlib import Path
