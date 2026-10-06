@@ -12,16 +12,16 @@ python -m scripts.profile_bit_arches \
 
 ## 论文参数与实现假设
 
-来源：[ISSCC 2025 Slim-Llama](https://doi.org/10.1109/ISSCC49661.2025.10904761)，Fig.23.9.2/3/4/7。使用 200 MHz 工作点，不使用 25 MHz 下的 4.69 mW 推导时延。
+来源：[ISSCC 2025 Slim-Llama](https://doi.org/10.1109/ISSCC49661.2025.10904761)，Fig.23.9.2/3/4/7。默认使用用户提供的 Asyn-CIM 论文 Table V 中的 50 MHz 对比工作点，不使用 25 MHz 下的 4.69 mW 或 200 MHz 峰值吞吐推导这个工作点的时延。
 
 | 项目 | 默认值与依据 |
 |---|---|
 | SBC | 8 clusters × 8 SBC = 64 |
 | 每个 SBC | 8 BMM columns；每 column 8 S-LUT |
 | S-LUT | 8 × 7-bit register file，2 个读口 |
-| 时钟 | 200 MHz；论文范围 25–200 MHz |
+| 时钟 | 50 MHz，与 Asyn-CIM Table V 一致；原论文范围 25–200 MHz |
 | 片上 SRAM | 论文写 500 KB，代码明确按 500×1024=512000 bytes 解释 |
-| 外部带宽 | 1.6 GB/s @200 MHz，十进制 GB/s |
+| 外部带宽 | 默认 null：50 MHz 下未确认；原文仅报告 1.6 GB/s @200 MHz |
 | 内部 SRAM/NoC 带宽 | 未公开；SRAM 带宽默认 null，可显式提供 |
 | 激活 | 原文 INT4/8/16；SBC 以 4-bit 单元结合 aggregation |
 | 权重 | Fig.23.9.7：INT1–16 或 ternary；当前量化框架/collector 使用 INT2–16，默认 INT4 |
@@ -31,6 +31,8 @@ python -m scripts.profile_bit_arches \
 | 中心结果存储/输出复用吞吐 | 默认 512 vectors/cycle，按 column 数作分析假设，可配置 |
 
 INT4 位于论文支持范围内；原文没有 FP8×INT4 Qwen 实测，不能将 4.92–13.1 TOPS 或 Llama3B 的归一化时延当作这一 workload 的实测性能。
+
+本次只调整默认硬件时钟及带宽缺失处理，不改变数值 forward、校准、量化 scale、采样、聚类、周期或字节计算。同样操作数下，50 MHz 计算时间为旧 200 MHz 的四倍；旧结果保留其原配置，不会自动变成新工作点。200 MHz 峰值、25 MHz 功耗及 50 MHz benchmark 不可混作同一工作点。
 
 ## 静态权重输出复用
 
@@ -72,9 +74,9 @@ QK/PV 的 B 是动态 FP8 K/V，仅走 Buffer，不进行静态中心聚类或�
 | minimum_traffic_full_overlap_seconds | max(compute, 最低原始字节/DRAM 带宽, 已提供的 local SRAM 时间) |
 | capacity_window_no_overlap_seconds | compute＋容量窗口片外搬运＋已提供的 local SRAM 时间 |
 
-前者采用乐观最低流量与重叠，不保证能在 500 KB 内实现；后者是所选容量窗口策略且无重叠，未保证包围真实硬件结果。没有内部 SRAM 带宽时，该项不加入数字，missing_costs 保留此缺口；不能把 null 理解为硬件无停顿。
+未填片外带宽时，只导出周期、计算时间、流量和位宽诊断；per_phase_seconds、gemm_and_io_seconds 和 conditional_e2e_seconds 为 null，missing_costs 记录缺口。提供片外带宽后，前者采用乐观最低流量与重叠，不保证能在 500 KB 内实现；后者是所选容量窗口策略且无重叠，未保证包围真实硬件结果。没有内部 SRAM 带宽时，该项不加入数字，missing_costs 保留此缺口；不能把 null 理解为硬件无停顿。
 
-按默认 1.6 GB/s，14B W4 的权重搬运会很重要。可覆盖外部速率和内部带宽，例如 --slimllama-dram-bandwidth-gbps 1.6 --slimllama-sram-bandwidth-gbps <value>；第二项必须来自具体假设，不是论文默认参数。频率降低时需要同步选择相应带宽，不能把 25 MHz 功耗点和 200 MHz 带宽混在一起。
+使用 --slimllama-dram-bandwidth-gbps <value> 指定所选工作点的片外速率，使用 --slimllama-sram-bandwidth-gbps <value> 指定内部带宽，单位均为十进制 GB/s。50 MHz 下的速率必须来自明确来源或标为系统假设，不自动按时钟缩放，也不默认借用 200 MHz 的 1.6 GB/s。若要复现之前的 200 MHz 情景，在 YAML 副本的 slimllama 段显式设置 frequency_hz: 200000000.0 和 dram_bytes_per_second: 1600000000.0，并用 --config 选择该副本。
 
 ## 导出和剩余成本
 

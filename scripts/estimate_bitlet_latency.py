@@ -17,7 +17,7 @@ def estimate(summary, other):
     decode_other = sum(other["decode_step_seconds"])
     modeled = summary["latency"]["gemm_and_io_seconds"]
     if modeled is None:
-        raise ValueError("GEMM/IO estimate is unavailable; supply BitWave DRAM bandwidth during collection")
+        raise ValueError("GEMM/IO estimate is unavailable; supply the selected backend's DRAM bandwidth during collection")
     e2e = {key: value+prefill_other+decode_other for key, value in modeled.items()}
     decode = summary["latency"]["per_phase_seconds"].get("decode", {})
     return dict(schema_version=1, backend=summary["backend"], source_commit=workload.get("source_commit"),

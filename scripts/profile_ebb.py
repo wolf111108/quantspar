@@ -95,7 +95,7 @@ def parse_args(argv=None, backend="ebb"):
         parser.add_argument("--slimllama-weight-clusters", type=int,
                             help="Prototype count; paper benchmark uses 128")
         parser.add_argument("--slimllama-dram-bandwidth-gbps", type=float,
-                            help="Override decimal GB/s; default 1.6 at 200 MHz from Fig.23.9.7")
+                            help="Explicit decimal GB/s at selected clock; unspecified at default 50 MHz (paper: 1.6 at 200 MHz)")
         parser.add_argument("--slimllama-sram-bandwidth-gbps", type=float,
                             help="Explicit internal SRAM bandwidth assumption; not published in digest")
     return parser.parse_args(argv)
@@ -404,10 +404,15 @@ def main(argv=None, *, backend="ebb"):
                       f"DRAM bandwidth supplied={document['latency']['dram_bandwidth_supplied']}")
             elif name == "slimllama":
                 seconds = result["latency"]
-                print(f"{phase}: Slim-Llama conditional S-LUT/DRAM scenarios "
-                      f"{seconds['minimum_traffic_full_overlap_seconds']:.6f}.."
-                      f"{seconds['capacity_window_no_overlap_seconds']:.6f} s; "
-                      f"sampled calls={result['sampled_calls']}; excludes unmodeled control/conversion costs")
+                if document["latency"]["dram_bandwidth_supplied"]:
+                    print(f"{phase}: Slim-Llama conditional S-LUT/DRAM scenarios "
+                          f"{seconds['minimum_traffic_full_overlap_seconds']:.6f}.."
+                          f"{seconds['capacity_window_no_overlap_seconds']:.6f} s; "
+                          f"sampled calls={result['sampled_calls']}; excludes unmodeled control/conversion costs")
+                else:
+                    print(f"{phase}: Slim-Llama conditional S-LUT compute "
+                          f"{seconds['mapped_compute_seconds']:.6f} s; "
+                          f"sampled calls={result['sampled_calls']}; GEMM/IO unavailable without DRAM bandwidth")
             else:
                 seconds = result["compute_seconds"]
                 print(f"{phase}: conditional compute bounds "
@@ -418,4 +423,3 @@ def main(argv=None, *, backend="ebb"):
 
 if __name__ == "__main__":
     main()
-

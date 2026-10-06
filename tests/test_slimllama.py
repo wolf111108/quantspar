@@ -76,11 +76,48 @@ def scalar_stage(a, b, spec_a, spec_b, config, mode):
 
 
 class SlimLlamaTests(unittest.TestCase):
+    def test_clock_rescaling_missing_dram_and_selected_point_export(self):
+        a, b = torch.ones(1, 8), torch.ones(2, 8)
+        low = SlimLlamaConfig(output_reuse=False, prefill_sample_waves=0)
+        high = replace(low, frequency_hz=200e6)
+        first = measure_slimllama_mapping(a, b, 4, 4, 8, 2, low)
+        second = measure_slimllama_mapping(a, b, 4, 4, 8, 2, high)
+        self.assertEqual(first["cycles"], second["cycles"])
+        self.assertAlmostEqual(first["compute_seconds"]["mapped_tiles"],
+                               4*second["compute_seconds"]["mapped_tiles"])
+        traffic, latency = traffic_and_latency(first, a, b, 4, 4, "q_proj", {}, low)
+        self.assertGreater(traffic["dram_bytes_minimum"], 0)
+        self.assertNotIn("minimum_dram_seconds", latency)
+        self.assertNotIn("minimum_traffic_full_overlap_seconds", latency)
+        work = dict(status="complete", decode_steps=0, completed_decode_steps=0)
+        rest = dict(schema_version=1, includes_lm_head=True, prefill_seconds=.01, decode_step_seconds=[])
+        with tempfile.TemporaryDirectory() as tmp:
+            for config in (low, replace(high, dram_bytes_per_second=1.6e9)):
+                stats = SlimLlamaStats(config)
+                for _ in range(2):
+                    stats.collect("q_proj", 0, a, b, 4, 4, 8, 2, "prefill", {})
+                doc = stats.export(Path(tmp)/"summary.json", work, rest)
+                self.assertEqual(doc["phases"]["prefill"]["calls"], 2)
+                self.assertEqual(doc["paper_parameters"]["selected_frequency_hz"], config.frequency_hz)
+                from scripts.estimate_bitlet_latency import estimate
+                if config.dram_bytes_per_second is None:
+                    self.assertIsNone(doc["latency"]["per_phase_seconds"])
+                    self.assertIsNone(doc["latency"]["gemm_and_io_seconds"])
+                    self.assertIsNone(doc["latency"]["conditional_e2e_seconds"])
+                    self.assertIn("external DRAM bandwidth at selected operating point", doc["latency"]["missing_costs"])
+                    with self.assertRaisesRegex(ValueError, "DRAM bandwidth"):
+                        estimate(doc, rest)
+                else:
+                    self.assertAlmostEqual(doc["phases"]["prefill"]["latency"]["minimum_dram_seconds"],
+                                           2*traffic["dram_bytes_minimum"]/1.6e9)
+                    self.assertEqual(estimate(doc, rest)["conditional_e2e_seconds"], doc["latency"]["conditional_e2e_seconds"])
+                stats.close()
+
     def test_paper_defaults_shared_quantization_and_invalid_parameters(self):
         config = SlimLlamaConfig()
         self.assertEqual((config.sbcs, config.columns, config.sluts_per_column), (64, 512, 8))
         self.assertEqual((config.frequency_hz, config.sram_bytes, config.dram_bytes_per_second),
-                         (200e6, 512000, 1.6e9))
+                         (50e6, 512000, None))
         self.assertIsNone(config.sram_bytes_per_second)
         root = Path(__file__).resolve().parents[1]
         old = yaml.safe_load((root/"config/qwen2_14b_bitlet_bitwave_f8i4_2048_256.yaml").read_text())
@@ -225,6 +262,7 @@ class SlimLlamaTests(unittest.TestCase):
         config = SlimLlamaConfig(sbc_clusters=1, sbcs_per_cluster=2, columns_per_sbc=2,
             sluts_per_column=2, weight_clusters=2, prefill_sample_waves=7, chunk_waves=1,
             sram_bytes=2048, sram_bytes_per_second=3.2e9)
+        config = replace(config, dram_bytes_per_second=1.6e9)
         plan = prepare_weight_plan(w.t(), 4, config, seed=3)
         one = measure_slimllama_mapping(a, w, "e4m3", 4, 81, 19, config, seed=31, weight_plan=plan)
         many = measure_slimllama_mapping(a, w, "e4m3", 4, 81, 19, replace(config, chunk_waves=3), seed=31, weight_plan=plan)
@@ -249,7 +287,7 @@ class SlimLlamaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             configs = dict(bitlet_config=dict(pe_count=2, group_size=8, decode_sample_waves=0),
                 bitwave_config=dict(decode_sample_waves=0, dataflow="SU2"),
-                slimllama_config=dict(decode_sample_waves=0))
+                slimllama_config=dict(decode_sample_waves=0, dram_bytes_per_second=1.6e9))
             joint = QuantStatManager(tmp, **configs)
             single = QuantStatManager(tmp, slimllama_config=configs["slimllama_config"])
             a, b = torch.ones(1, 4, 1, 8), torch.ones(1, 4, 8, 9)
@@ -343,6 +381,9 @@ class SlimLlamaTests(unittest.TestCase):
             comparison = json.loads((tmp/"joint/bit_arch_comparison.json").read_text())
             self.assertEqual(comparison["workload"]["profile_architectures"], list(names))
             slim = joint_docs["slimllama"]
+            self.assertEqual(slim["config"]["frequency_hz"], 50e6)
+            self.assertEqual(slim["paper_parameters"]["selected_frequency_hz"], 50e6)
+            self.assertIsNone(slim["latency"]["gemm_and_io_seconds"])
             self.assertEqual(len(slim["weight_preprocessing"]), 7)
             self.assertEqual(slim["phases"]["prefill"]["output_reuse_calls"], 7)
             for name in names:
@@ -355,7 +396,8 @@ class SlimLlamaTests(unittest.TestCase):
             rest = dict(schema_version=1, includes_lm_head=True, prefill_seconds=.01, decode_step_seconds=[.001, .002])
             (tmp/"rest.json").write_text(json.dumps(rest))
             command = [sys.executable, "-m", "scripts.profile_bit_arches", *args, "--skip-calibration", "--greedy-decode",
-                       "--bitwave-dram-bandwidth-gbps", "12.8", "--other-latency-json", str(tmp/"rest.json"),
+                       "--bitwave-dram-bandwidth-gbps", "12.8", "--slimllama-dram-bandwidth-gbps", "1.6",
+                       "--other-latency-json", str(tmp/"rest.json"),
                        "--output-dir", str(tmp/"greedy")]
             process = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=60)
             self.assertEqual(process.returncode, 0, process.stderr)

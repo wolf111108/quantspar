@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-06 — Align joint profiling clocks with Asyn-CIM Table V
+
+- 目的：让同次校准/推理的 Bitlet、BitWave、Slim-Llama 默认频率对应用户提供的 Asyn-CIM Table V，避免混用 Slim-Llama 的 50 MHz benchmark 与 200 MHz 带宽。
+- 内容：Bitlet 1 GHz、BitWave 250 MHz 保持不变；联合 YAML 和 SlimLlamaConfig 默认改为 50 MHz，50 MHz 下未确认的片外带宽改为 null。未知 DRAM 时仍采集周期、计算时间和全部字节，汇总 GEMM/IO/E2E 保持 null，即使补其他算子也不生成完整时延；支持原有显式带宽覆盖。selected_frequency_hz 改为实际配置值，导出 Table V/峰值频率和带宽缺口，更新 CLI 输出/help、离线补成本错误、README 与说明，并保留显式恢复 200 MHz/1.6 GB/s 情景的办法。
+- 验证：真实 PyTorch 2.6.0+cpu、Transformers 4.43.1 下全套 66 项测试通过；11 项 Slim-Llama 单独测试也通过。新增检查相同操作数在 50/200 MHz 下周期不变、计算时间比为 4、未知 DRAM 下多调用聚合/导出为 null、补其他算子仍拒绝 E2E、显式 200 MHz/1.6 GB/s 情景可恢复，selected_frequency_hz 对应实际配置。小型 Qwen 验证一次校准/共同推理及三者独立结果一致、默认无带宽路径、显式带宽下 teacher-forced/greedy CLI 和 E2E 补成本；CLI help、语法及 diff 检查通过。
+- 限制与旧结果影响：未运行完整 14B、CUDA 或 RTL；只对齐频率，不声称所有硬件参数已补齐或完整 E2E 已验证。相同操作数/映射下 Slim-Llama 周期、流量、量化与 scale 不变，50 MHz 计算时间为旧 200 MHz 的四倍；旧报告仍是其原工作点，需按已记录周期重算。50 MHz 带宽没有静默借用或线性缩放；手动提供的速率是用户选择的工作点/系统假设。原有 EBB 默认、其他架构资源与周期公式不变；Table V 中的峰值/功耗是否与各频率同点仍需单独核对。
+
 ## 2026-10-06 — Add offline Fig16 capacity and bandwidth latency estimates
 
 - 目的：增加不加载 14B、不采集真实操作数的另一种估算方法，按 Fig.16 Qwen2.5-14B 倍率、各架构原生计算资源与片外带宽估计 2048 prefill＋256 decode 的条件时延。

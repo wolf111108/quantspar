@@ -142,7 +142,9 @@ bitwave:
   sample_seed: 23
   bit_flip: false
 
-# Slim-Llama ISSCC 2025 Fig.23.9.2/3/4/7, selected 200 MHz operating point.
+# Geometry: Slim-Llama ISSCC 2025 Fig.23.9.2/3/4/7.
+# Frequency: Asyn-CIM Table V, selected 50 MHz comparison point.
+# Fig.23.9.7 reports 1.6 GB/s only at 200 MHz; 50 MHz bandwidth is unknown.
 # FP8 and clustering are explicit analytical extensions; forward stays unchanged.
 slimllama:
   enabled: true
@@ -150,9 +152,9 @@ slimllama:
   sbcs_per_cluster: 8
   columns_per_sbc: 8
   sluts_per_column: 8
-  frequency_hz: 200000000.0
+  frequency_hz: 50000000.0
   sram_bytes: 512000
-  dram_bytes_per_second: 1600000000.0
+  dram_bytes_per_second: null
   sram_bytes_per_second: null
   output_storage_bytes: 2
   accumulator_storage_bytes: 4

@@ -2,6 +2,8 @@
 
 scripts.profile_bit_arches 共用一次模型加载、一次校准和一条 prefill/decode 输入序列，将每次实际量化得到的 A/B 张量交给三个独立 collector。默认配置为 config/qwen2_14b_bit_arches_f8i4_2048_256.yaml：batch=1、2048 prefill＋256 次 decode forward，IA FP8 E4M3FN、Linear W INT4、FP8 KV；与此前两个后端使用相同量化配置和 scale 目录。Slim-Llama 的完整口径见 [说明](slimllama.md)。
 
+联合默认频率对齐 Asyn-CIM 论文 Table V：Bitlet 1 GHz、BitWave 250 MHz、Slim-Llama 50 MHz。Slim-Llama 的 1.6 GB/s 原文带宽只对应 200 MHz，50 MHz 默认带宽为 null；需显式提供 --slimllama-dram-bandwidth-gbps 才生成其 GEMM/IO 总时间。该改动不改变量化或周期统计。
+
 ~~~bash
 python -m scripts.profile_bit_arches \
   --model-path /path/to/Qwen2.5-14B \

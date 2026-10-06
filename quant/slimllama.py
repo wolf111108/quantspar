@@ -25,9 +25,11 @@ class SlimLlamaConfig:
     sbcs_per_cluster: int = 8
     columns_per_sbc: int = 8
     sluts_per_column: int = 8
-    frequency_hz: float = 200e6
+    # Asyn-CIM Table V comparison point; Fig.23.9.7 peak point is 200 MHz.
+    frequency_hz: float = 50e6
     sram_bytes: int = 500*1024
-    dram_bytes_per_second: float = 1.6e9
+    # Only the 200 MHz bandwidth is published. Do not borrow it at 50 MHz.
+    dram_bytes_per_second: float | None = None
     # Internal SRAM/NoC bandwidth is not published in the digest.
     sram_bytes_per_second: float | None = None
     output_storage_bytes: int = 2
@@ -61,7 +63,7 @@ class SlimLlamaConfig:
                 raise ValueError(f"Slim-Llama {key} must be a nonnegative integer")
         for key in ("frequency_hz", "dram_bytes_per_second", "sram_bytes_per_second"):
             value = getattr(self, key)
-            if value is None and key == "sram_bytes_per_second":
+            if value is None and key in ("dram_bytes_per_second", "sram_bytes_per_second"):
                 continue
             if (isinstance(value, bool) or not isinstance(value, (int, float)) or
                     not math.isfinite(value) or value <= 0):
@@ -417,14 +419,15 @@ def traffic_and_latency(result, activation, weight, a_spec, b_spec, name, contex
         B_read_bytes_window_schedule=b_window, dram_bytes_minimum=minimum_bytes,
         dram_bytes_window_schedule=window_bytes, **{f"local_{key}": value for key, value in local.items()})
     compute = result["compute_seconds"]["mapped_tiles"]
-    minimum = minimum_bytes/config.dram_bytes_per_second
-    window = window_bytes/config.dram_bytes_per_second
     local_bytes = sum(local.values())
     local_seconds = local_bytes/config.sram_bytes_per_second if config.sram_bytes_per_second is not None else 0.
-    latency = dict(mapped_compute_seconds=compute, minimum_dram_seconds=minimum,
-        window_dram_seconds=window, modeled_local_sram_seconds=local_seconds,
-        minimum_traffic_full_overlap_seconds=max(compute, minimum, local_seconds),
-        capacity_window_no_overlap_seconds=compute+window+local_seconds)
+    latency = dict(mapped_compute_seconds=compute, modeled_local_sram_seconds=local_seconds)
+    if config.dram_bytes_per_second is not None:
+        minimum = minimum_bytes/config.dram_bytes_per_second
+        window = window_bytes/config.dram_bytes_per_second
+        latency.update(minimum_dram_seconds=minimum, window_dram_seconds=window,
+            minimum_traffic_full_overlap_seconds=max(compute, minimum, local_seconds),
+            capacity_window_no_overlap_seconds=compute+window+local_seconds)
     return traffic, latency
 
 
@@ -508,19 +511,23 @@ class SlimLlamaStats:
         workload = workload or {}
         completed = workload.get("status") == "complete"
         scenarios = ("minimum_traffic_full_overlap_seconds", "capacity_window_no_overlap_seconds")
-        phases = {phase: {key: value["latency"][key] for key in scenarios} for phase, value in self.phases.items()}
-        total = {key: sum(value[key] for value in phases.values()) for key in scenarios}
+        io_available = self.config.dram_bytes_per_second is not None
+        phases = ({phase: {key: value["latency"][key] for key in scenarios} for phase, value in self.phases.items()}
+                  if io_available else None)
+        total = ({key: sum(value[key] for value in phases.values()) for key in scenarios}
+                 if io_available else None)
         rest = None
         if other_latency is not None:
             validate_other_latency(other_latency, workload.get("decode_steps"))
             rest = dict(prefill_seconds=other_latency["prefill_seconds"],
                         decode_seconds=sum(other_latency["decode_step_seconds"][:workload.get("completed_decode_steps", 0)]))
         e2e = ({key: value+rest["prefill_seconds"]+rest["decode_seconds"] for key, value in total.items()}
-               if completed and rest is not None else None)
+               if completed and total is not None and rest is not None else None)
         doc = dict(schema_version=1, backend="slimllama", config=asdict(self.config), sources=dict(isscc2025=PAPER_URL),
             paper_parameters=dict(sbc_clusters=8, sbcs_per_cluster=8, columns_per_sbc=8, sluts_per_column=8,
                 slut_registers=8, slut_register_bits=7, slut_read_ports=2,
-                frequency_range_hz=[25e6, 200e6], selected_frequency_hz=200e6,
+                frequency_range_hz=[25e6, 200e6], selected_frequency_hz=self.config.frequency_hz,
+                asyn_cim_table_v_frequency_hz=50e6, peak_performance_frequency_hz=200e6,
                 sram_reported="500 KB", sram_bytes_interpretation=500*1024,
                 dram_bytes_per_second_at_200mhz=1.6e9, native_activation_bits=[4, 8, 16],
                 native_weight_bits="INT1..16 or ternary", benchmark_weight_clusters=128,
@@ -533,9 +540,11 @@ class SlimLlamaStats:
             latency=dict(scope="conditional S-LUT integer-slice and original-code transport extension",
                 collection_complete=completed, per_phase_seconds=phases, gemm_and_io_seconds=total,
                 supplied_other_latency=rest, conditional_e2e_seconds=e2e,
+                dram_bandwidth_supplied=io_available,
                 internal_sram_bandwidth_supplied=self.config.sram_bytes_per_second is not None,
                 missing_costs=([] if rest is not None else ["LM head", "Softmax/RMSNorm/RoPE/SiLU/residual"]) +
                     ["FP8 conversion/group scale and slice aggregation", "runtime residual formation", "NoC/control stalls"] +
+                    ([] if io_available else ["external DRAM bandwidth at selected operating point"]) +
                     ([] if self.config.sram_bytes_per_second is not None else ["internal SRAM bandwidth"]) +
                     (["LUT setup"] if self.config.lut_setup_cycles == 0 else [])),
             assumptions=[
@@ -562,7 +571,8 @@ class SlimLlamaStats:
                 "Minimum transport/full overlap is optimistic; capacity-window/no overlap rereads original W4 plus centers/IDs and streams FP8 A.",
                 "Residuals are host-preprocessed for analysis, not an implemented off-chip compressed representation or device kernel.",
                 "Internal SRAM/NoC bandwidth is unpublished; absent bandwidth contributes no modeled SRAM stall, not a measured zero cost.",
-                "Default 200MHz/1.6GB/s corresponds to the same paper operating point; 4.69mW belongs to 25MHz and is not used here.",
+                "Default 50MHz matches Asyn-CIM Table V; 1.6GB/s and peak TOPS belong to 200MHz, and 4.69mW belongs to 25MHz.",
+                "External bandwidth at 50MHz is unspecified; provide an explicit assumption before generating GEMM/IO or E2E estimates.",
                 "Output two bytes, accumulator four bytes, setup zeros, sign/slice logic and control are modeling assumptions.",
                 "Remaining operators are supplied separately; estimates are conditional scenarios, not hardware E2E measurements or physical bounds.",
             ])
