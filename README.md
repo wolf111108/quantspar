@@ -35,10 +35,10 @@ python -m scripts.estimate_paper_latency \
 ~~~bash
 python -m scripts.profile_bit_arches \
   --model-path /path/to/Qwen2.5-14B \
-  --output-dir outputs/bit_arches_2048_256
+  --output-dir outputs/bit_arches_256_32
 ~~~
 
-默认保持 2048＋256、IA FP8 / W INT4，共用原量化和 scale 设置；分别输出三份 summary/trace 和 bit_arch_comparison.json。默认频率对齐 Asyn-CIM Table V：Bitlet 1 GHz、BitWave 250 MHz、Slim-Llama 50 MHz。Slim-Llama 保留 64 SBC、500 KB SRAM，50 MHz 下片外带宽未确认，默认 null，可用 --slimllama-dram-bandwidth-gbps 显式提供；未填时只输出计算时间/流量，GEMM/IO 和 E2E 保持 null。它以实际权重中心和无损差量建模输出复用；FP8 分片、聚类算法及调度是显式分析假设。BitWave 论文未给 DRAM 速率，可用 --bitwave-dram-bandwidth-gbps 指定搬运假设。--architectures bitlet bitwave 可只运行两者；原双后端 YAML 仍只启用其两个 collector，三种架构也保留单独入口。
+联合入口默认 256＋32、IA FP8 / W INT4，采用独立短 scale 目录；显式旧 YAML 仍保持原长度与 scale 设置。分别输出三份 summary/trace 和 bit_arch_comparison.json。默认频率对齐 Asyn-CIM Table V：Bitlet 1 GHz、BitWave 250 MHz、Slim-Llama 50 MHz。Slim-Llama 保留 64 SBC、500 KB SRAM，50 MHz 下片外带宽未确认，默认 null，可用 --slimllama-dram-bandwidth-gbps 显式提供；未填时只输出计算时间/流量，GEMM/IO 和 E2E 保持 null。它以实际权重中心和无损差量建模输出复用；FP8 分片、聚类算法及调度是显式分析假设。BitWave 论文未给 DRAM 速率，可用 --bitwave-dram-bandwidth-gbps 指定搬运假设。--architectures bitlet bitwave 可只运行两者；原双后端 YAML 仍只启用其两个 collector，三种架构也保留单独入口。
 
 Bitlet 默认使用原论文 32 PEs、64 元素组、1 GHz、两条各 12.8 GB/s DMA 和 25.6 GB/s local buffer 带宽；容量未报告，保持 null。安装全模型依赖后可直接运行：
 
@@ -52,3 +52,7 @@ python -m scripts.profile_bitlet \
 
 Qwen 包装器与校准加载器已经上传。全模型依赖见 `requirements-model.txt`；EBB 使用独立的 `scripts.profile_ebb` 入口和 `qwen2_14b_ebb_f8i4.yaml` 配置，默认收集 8192 prefill＋1024 decode。内存有限时使用 `config/qwen2_14b_ebb_f8i4_2048_256.yaml`，校准和 profiling 都缩短，scale 目录独立；命令行缩短 prefill 也会默认限制校准长度。EBB 输出是基于显式 FP8 对齐和调度假设的 GEMM 周期范围，不是论文测得的 FP8 性能或端到端时延。完整 14B checkpoint 与 CUDA 实验需本地运行。
 
+
+### Short online profiles / offline target-length estimates
+
+`python -m scripts.profile_bit_arches` now defaults to 256+32. Select collectors with `--architectures`; EBB is selected alone at 275 MHz in the new short config. Completed runs export per-layer/operator/phase cycle coefficients. `python -m scripts.estimate_profile_latency --profile-dir ... --output-dir ...` estimates target shapes without loading weights, keeps missing IO/E2E inputs null, and accepts target remaining costs from LLMCompass. See [short_profile_latency.md](docs/short_profile_latency.md) for assumptions and commands.

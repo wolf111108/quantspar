@@ -1,14 +1,14 @@
 # Slim-Llama：FP8 / INT4 的条件时延估计
 
-入口 scripts.profile_slimllama 单独采集，scripts.profile_bit_arches 默认一次推理同时采集 Bitlet、BitWave 和 Slim-Llama。全模型依赖和量化配置与既有 runner 相同，batch=1、2048 prefill＋256 次 decode forward。collector 不修改权重、激活、量化 scale 或数值 forward；这里只生成统计与分析时延，完整 14B/CUDA 由本地运行。
+入口 scripts.profile_slimllama 单独采集，scripts.profile_bit_arches 默认一次推理同时采集 Bitlet、BitWave 和 Slim-Llama。全模型依赖和量化配置与既有 runner 相同，batch=1；联合入口新默认为256 prefill＋32次 decode forward，独立入口及显式旧 YAML 仍为2048＋256。collector 不修改权重、激活、量化 scale 或数值 forward；这里只生成统计与分析时延，完整 14B/CUDA 由本地运行。
 
 ~~~bash
 python -m scripts.profile_bit_arches \
   --model-path /path/to/Qwen2.5-14B \
-  --output-dir outputs/bit_arches_2048_256
+  --output-dir outputs/bit_arches_256_32
 ~~~
 
-匹配已有量化配置的 scales 可加 --skip-calibration。独立入口将同一默认 YAML 中的 Slim-Llama 段交给 manager，不启用另两个 collector。显式选择 --architectures slimllama 也可单独运行。
+匹配已有量化配置的 scales 可用 --scale-dir 指定，并加 --skip-calibration。独立入口将同一默认 YAML 中的 Slim-Llama 段交给 manager，不启用另两个 collector。显式选择 --architectures slimllama 也可单独运行。
 
 ## 论文参数与实现假设
 
@@ -86,9 +86,11 @@ slimllama_summary.json 包含独立的 phase/layer/step 周期、流量、mode/�
 
 ~~~bash
 python -m scripts.estimate_bitlet_latency \
-  --summary outputs/bit_arches_2048_256/slimllama_summary.json \
+  --summary outputs/bit_arches_256_32/slimllama_summary.json \
   --other-latency-json outputs/slimllama_other_latency.json \
   --output outputs/slimllama_e2e.json
 ~~~
 
 剩余成本 schema 与 [Bitlet 说明](bitlet.md) 相同：schema_version=1、includes_lm_head=true、prefill_seconds 和覆盖每次 decode forward 的 decode_step_seconds。联合 --other-latency-json 表示三者共用剩余成本假设；架构专属成本可在采集后分别合并成三份文件，再调用离线估计，无需重跑模型。
+
+短采集后的逐层/算子校准与离线目标长度估计见 [short_profile_latency.md](short_profile_latency.md)。

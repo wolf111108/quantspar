@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-06 — Add short online profiles and calibrated offline latency extrapolation
+
+- 目的：用 256＋32 在线采集当前量化数据，再按目标 shape 重新计算长序列 GEMM/最低搬运量，减少完整长序列 collector 开销，提供类似 quantspar＋LLMCompass 的数据/系统分工。
+- 内容：新增独立短 YAML（独立 scales，校准长度256，64样本不变）；联合入口默认短配置，继续默认三架构共同采集，支持单独选择 EBB（275 MHz）和逐架构时钟覆盖。完整 summary 自动导出逐层/算子/phase cycles/MAC profile；离线标准库入口兼容旧完整 summary，重算 Linear、完整 attention、逐 decode context 与 GQA 物理 KV/紧凑 W4 字节，逐层算子合并重叠/串行情景，输出 JSON/CSV、dense/online_mapped、EBB 两种映射和可选在线 dense＋显式论文倍率。要求覆盖完整、操作数工作量一致，超限 EBB 默认拒绝外推，显式允许后保留标记；目标其他成本按架构导入、强制验证目标长度，缺成本或带宽为 null。README 和专门说明记录公式、命令、校准/shape 假设及现有 LLMCompass 需要补充的 memory/scheduler 工作。
+- 验证：新增 8 项测试通过，覆盖独立算子/GQA 字节公式、同 shape 周期回算、时钟与 IO 分离、论文倍率不双计、覆盖/超限拒绝、零 decode、目标其他成本/激活 IO、无 PyTorch 的 python -S CLI 与输出保护；真实小型 Qwen 在 PyTorch 2.6.0+cpu、Transformers 4.43.1 下分别选择 EBB 与 BitWave，验证校准/短推理、profile 导出与离线 compute 回算。全套 74 项检查通过，语法与 diff 检查通过。
+- 限制与旧结果影响：未运行完整14B、CUDA、长序列或物理芯片；没有修改 LLMCompass 后端/运行其系统仿真。cycles/MAC 固定假设包含源 padding/utilization/dataflow/FP8 扩展，长上下文稀疏与分片变化尚未验证；最低 traffic 未含容量重读、CIM refill、metadata、bank/NoC/spill，补成本后的 E2E 仍是条件情景。旧 YAML/独立入口、量化与映射公式不变，旧完整 summary 可复用；联合入口的新默认长度/scale路径改变，显式旧config保持旧长度。短校准 scale 可能改变分布，复用旧匹配 scales 的来源须自行保留。EBB仍单独采集，未宣称四架构共同推理；Bitlet双DMA未自动等同单片外带宽；不自动赋予 Bitlet/Slim-Llama Fig16 倍率。
+
 ## 2026-10-06 — Align joint profiling clocks with Asyn-CIM Table V
 
 - 目的：让同次校准/推理的 Bitlet、BitWave、Slim-Llama 默认频率对应用户提供的 Asyn-CIM Table V，避免混用 Slim-Llama 的 50 MHz benchmark 与 200 MHz 带宽。

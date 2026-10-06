@@ -54,7 +54,8 @@ def parse_args(argv=None, backend="ebb"):
     parser = argparse.ArgumentParser(description=(
         "One Qwen FP8/W4 inference pass with separate architecture collectors."
         if len(architectures) > 1 else f"Local Qwen FP8/W4 {backend} collection."))
-    default_config = ("config/qwen2_14b_bit_arches_f8i4_2048_256.yaml"
+    default_config = ("config/qwen2_14b_bit_arches_f8i4_256_32.yaml" if backend == "bit_arches" else
+                      "config/qwen2_14b_bit_arches_f8i4_2048_256.yaml"
                       if "slimllama" in architectures else
                       "config/qwen2_14b_bitlet_bitwave_f8i4_2048_256.yaml"
                       if "bitwave" in architectures else
@@ -76,8 +77,10 @@ def parse_args(argv=None, backend="ebb"):
                         help="torch.save LongTensor [tokens], or dict with input_ids; no dataset needed")
     parser.add_argument("--greedy-decode", action="store_true",
                         help="generate tokens; default uses teacher-forced tokens from the document")
+    parser.add_argument("--frequency-mhz", action="append", default=[],
+                        help="architecture=MHz; rescale compute without changing resources")
     if backend == "bit_arches":
-        parser.add_argument("--architectures", nargs="+", choices=("bitlet", "bitwave", "slimllama"),
+        parser.add_argument("--architectures", nargs="+", choices=("bitlet", "bitwave", "slimllama", "ebb"),
                             help="Default: enabled collectors in YAML (all three in default YAML); select a subset")
     if backend != "ebb":
         parser.add_argument("--exact", action="store_true", help="Enumerate all tiles in every requested collector")
@@ -219,9 +222,14 @@ def main(argv=None, *, backend="ebb"):
         raise ValueError("Enable at least one requested architecture in profiling YAML")
     if len(architectures) != len(set(architectures)):
         raise ValueError("--architectures must not contain duplicates")
+    if "ebb" in architectures and len(architectures) > 1:
+        raise ValueError("EBB uses a separate collector path; select --architectures ebb alone")
     for name in architectures:
         if name not in config:
             raise ValueError(f"Missing {name} section in profiling YAML")
+    from .estimate_profile_latency import overrides
+    for name, frequency in overrides(args.frequency_mhz, architectures, "frequency", 1e6).items():
+        config[name]["frequency_hz"] = frequency
     if args.scale_dir is not None:
         config["quantization"]["scale_dir"] = str(args.scale_dir)
     other_latency = None
@@ -229,6 +237,8 @@ def main(argv=None, *, backend="ebb"):
         if args.exact and (args.prefill_sample_waves is not None or args.decode_sample_waves is not None):
             raise ValueError("--exact cannot be combined with sample wave overrides")
         for name in architectures:
+            if name == "ebb":
+                continue  # EBB enumerates groups; wave sampling applies to the other collectors.
             for phase in ("prefill", "decode"):
                 value = 0 if args.exact else getattr(args, f"{phase}_sample_waves")
                 if value is not None:
@@ -318,6 +328,10 @@ def main(argv=None, *, backend="ebb"):
             export = getattr(manager, f"export_{name}_stats")
             documents[name] = (export(path, workload) if name == "ebb"
                                else export(path, workload, other_latency))
+            if workload.get("status") == "complete":
+                from .profile_bridge import build_profile
+                (args.output_dir/f"{name}_profile.json").write_text(
+                    json.dumps(build_profile(documents[name]), indent=2, allow_nan=False)+"\n")
         if len(documents) > 1:
             comparison = dict(schema_version=1, workload=workload,
                 shared_quantized_operands=True,

@@ -1,16 +1,16 @@
 # 一次 Qwen 推理同时收集 Bitlet、BitWave 与 Slim-Llama
 
-scripts.profile_bit_arches 共用一次模型加载、一次校准和一条 prefill/decode 输入序列，将每次实际量化得到的 A/B 张量交给三个独立 collector。默认配置为 config/qwen2_14b_bit_arches_f8i4_2048_256.yaml：batch=1、2048 prefill＋256 次 decode forward，IA FP8 E4M3FN、Linear W INT4、FP8 KV；与此前两个后端使用相同量化配置和 scale 目录。Slim-Llama 的完整口径见 [说明](slimllama.md)。
+scripts.profile_bit_arches 共用一次模型加载、一次校准和一条 prefill/decode 输入序列，将每次实际量化得到的 A/B 张量交给三个独立 collector。默认配置为 config/qwen2_14b_bit_arches_f8i4_256_32.yaml：batch=1、256 prefill＋32 次 decode forward，IA FP8 E4M3FN、Linear W INT4、FP8 KV；量化格式保持原口径，但短配置使用独立 scale 目录；已有匹配 scales 可显式指定 --scale-dir 并复用。Slim-Llama 的完整口径见 [说明](slimllama.md)。
 
 联合默认频率对齐 Asyn-CIM 论文 Table V：Bitlet 1 GHz、BitWave 250 MHz、Slim-Llama 50 MHz。Slim-Llama 的 1.6 GB/s 原文带宽只对应 200 MHz，50 MHz 默认带宽为 null；需显式提供 --slimllama-dram-bandwidth-gbps 才生成其 GEMM/IO 总时间。该改动不改变量化或周期统计。
 
 ~~~bash
 python -m scripts.profile_bit_arches \
   --model-path /path/to/Qwen2.5-14B \
-  --output-dir outputs/bit_arches_2048_256
+  --output-dir outputs/bit_arches_256_32
 ~~~
 
-依赖仍为 requirements-model.txt。已生成并确认匹配的 Bitlet scales 可加 --skip-calibration 复用。首次校准需要 YAML 中的文本数据集；--token-file 只替代 profiling 输入。可先用独立 smoke scales 检查本地环境：
+依赖仍为 requirements-model.txt。已生成并确认匹配的 Bitlet scales 可用 --scale-dir 指定，并加 --skip-calibration 复用。首次校准需要 YAML 中的文本数据集；--token-file 只替代 profiling 输入。可先用独立 smoke scales 检查本地环境：
 
 ~~~bash
 python -m scripts.profile_bit_arches \
@@ -105,3 +105,5 @@ python -m scripts.profile_bit_arches \
 --other-latency-json 可同时补所选架构的 LM head 和其他算子耗时；缺这些成本时 E2E 保持 null。共用该文件表示沿用同一组剩余算子假设；各架构额外的格式/控制成本不同，应分别用离线补成本入口合并后重新估计。scripts.estimate_bitlet_latency 接受 Bitlet、BitWave（需已填 DRAM 速率）和 Slim-Llama summary，schema 与操作见 [Bitlet 说明](bitlet.md)。FP8 转换和分片累加成本需明确包含在剩余耗时中；不能把统计脚本的 GPU 墙钟时间作为硬件时延。
 
 本次仅在真实 CPU PyTorch/Transformers、小型 Qwen 上检查数值操作数共享、单次校准/推理、独立参考调度、单独/共同结果相同、两种 decode、cache、流式输出与失败关闭；完整 14B、CUDA、PPL 与 RTL 由本地实验补充。
+
+短序列采集及目标长度离线估计见 [short_profile_latency.md](short_profile_latency.md)。显式选择旧 2048＋256 YAML 可以保留原实验设置；--architectures ebb 单独选择 EBB（新短配置为275 MHz），不能与三者共同选择。
