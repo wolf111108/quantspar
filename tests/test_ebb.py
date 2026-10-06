@@ -18,6 +18,21 @@ from quant.quant_spec import parse_quant_spec
 
 
 class EBBTests(unittest.TestCase):
+    def test_transformers_version_window_matches_qwen2_api(self):
+        from scripts.profile_ebb import (TRANSFORMERS_MAX_EXCLUSIVE, TRANSFORMERS_MIN,
+                                         transformers_version_tuple)
+        def accepted(raw):
+            return TRANSFORMERS_MIN <= transformers_version_tuple(raw) < TRANSFORMERS_MAX_EXCLUSIVE
+        # Validated pin and the exercised lower bound stay supported.
+        self.assertTrue(accepted('4.43.1'))
+        self.assertTrue(accepted('4.40.0'))
+        self.assertTrue(accepted('4.44.2'))
+        # 4.45 moved RoPE to position_ids and dropped Cache.get_usable_length.
+        self.assertFalse(accepted('4.45.0'))
+        self.assertFalse(accepted('4.45.0rc1'))
+        self.assertFalse(accepted('5.0.0'))
+        self.assertFalse(accepted('4.39.0'))
+
     def test_paper_figure13_replicated_to_eight_lanes(self):
         config = EBBConfig(input_bits=8)
         # Two replicas of Fig.13's EB=[4,1,4,7], now on eight detector lanes.

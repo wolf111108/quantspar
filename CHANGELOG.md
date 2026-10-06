@@ -9,6 +9,13 @@
 - 验证：真实 PyTorch 2.6.0+cpu、Transformers 4.43.1 下 30 项测试通过；扩展保存小型 Qwen 的集成检查，用本地 tensor loader 实际校准并推理，确认 YAML 为 8192 时短 prefill 会使 loader 和模型都只校准 8 tokens，显式设置可改为 16 tokens；teacher-forced/greedy CLI 与旧回归通过。另验证新 YAML 的量化/EBB 参数一致、scale 隔离及无效参数拒绝；diff 检查通过。
 - 限制与旧结果影响：未运行完整 14B 或 CUDA；短序列位宽分布不能验证长序列的 EBB 收益/溢出率，工作量倍率不等于时延倍率，也未自动生成长序列端到端结果。8192 默认实验与 EBB 统计/映射公式不变；命令行缩短 prefill 后的首次校准长度会改变，需用独立 scale 目录记录新实验。已有 scale 不会因改长度自动重校准，复用时导出的请求配置不代表 scale 原始生成历史。
 
+## 2026-10-06 — Relax transformers version gate to a verified range
+
+- 目的：解除 `scripts/profile_ebb` 对 `transformers` 的精确相等断言，使已安装依赖（如 4.40.x）无需替换环境即可运行，同时不放弃对已知不兼容版本的拦截。
+- 内容：把 `!= "4.43.1"` 改为 `>=4.40,<4.45` 的范围检查，新增 `TRANSFORMERS_MIN`、`TRANSFORMERS_MAX_EXCLUSIVE` 与不引入新依赖的 `transformers_version_tuple`，错误信息改为报告实际版本、支持区间和越界原因；新增 `scripts/__init__.py` 使 `python -m scripts.<name>` 在本仓解析为本地包（原被 conda 环境 site-packages 中同名 `scripts` 包遮蔽，导致 `No module named scripts.profile_ebb`）；新增版本窗口边界回归测试。
+- 验证：真实 PyTorch 2.6.0+cpu、Transformers **4.40.0** 下 31 项测试通过（原 30 项＋版本窗口边界 1 项），其中 CLI 端到端用例（teacher-forced 与 greedy、含 subprocess）不再需要伪装版本号即通过；`py_compile` 通过。上界依据为逐 tag 源码核对：4.43.1／4.44.0 仍为 `rotary_emb(x, seq_len=...)` 且保留 `Cache.get_usable_length`，4.45.0 起改为 `rotary_emb(x, position_ids)` 并移除 `get_usable_length`。**4.40.0 与 4.43.1 为实际执行验证，4.41–4.44 仅签核对（未执行）；完整 14B 与 CUDA 工作负载未执行。**
+- 限制：不改变 `requirements-model.txt` 的 `transformers==4.43.1` 钉版本，也未扩大输出 schema。旧结果与已发表数字均在 4.43.1 下产生，本次放宽不改变任何数值路径，但 4.40–4.44 产生的统计结果与此前基线可能因底层实现差异而不可直接混用，需重跑才能对比。训练与生成路径（`0104_single_sample_inference.py` 的 qwen3.5 分支依赖 4.43+ 的 `AutoModelForImageTextToText`）不在本次放宽范围内。
+
 ## 2026-10-06 — Add MulTCIM EBB bounds and local Qwen profiling
 
 - 目的：为 Qwen2.5-14B 的 IA FP8 / Linear W INT4、8192 prefill＋1024 decode 收集论文 EBB 所需的实际有效位宽、分组失衡及位宽覆盖数据，提供可在本地运行的独立入口。

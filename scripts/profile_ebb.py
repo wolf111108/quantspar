@@ -11,6 +11,24 @@ from quant import load_config, QuantStatManager, QuantizedLinear, QuantizedMatMu
 
 LINEARS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
+# The Qwen2 attention patch relies on APIs that are stable in this window:
+#   rotary_emb(x, seq_len=...)  ->  changed to rotary_emb(x, position_ids) in 4.45
+#   Cache.get_usable_length()   ->  removed in 4.45
+# 4.43.1 is the validated pin; 4.40.x is exercised by the test suite; 4.44 is
+# signature-compatible but not executed here.
+TRANSFORMERS_MIN = (4, 40)
+TRANSFORMERS_MAX_EXCLUSIVE = (4, 45)
+
+
+def transformers_version_tuple(raw):
+    parts = []
+    for chunk in raw.split("."):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -129,8 +147,13 @@ def main(argv=None):
     prefill, decode = resolve_workload(config, args)
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable; select --device cpu for a small-model smoke run")
-    if importlib.metadata.version("transformers") != "4.43.1":
-        raise RuntimeError("This Qwen wrapper is validated with transformers==4.43.1; install requirements-model.txt")
+    installed = importlib.metadata.version("transformers")
+    if not TRANSFORMERS_MIN <= transformers_version_tuple(installed) < TRANSFORMERS_MAX_EXCLUSIVE:
+        raise RuntimeError(
+            f"transformers {installed} is outside the supported range "
+            f">=4.{TRANSFORMERS_MIN[1]},<4.{TRANSFORMERS_MAX_EXCLUSIVE[1]} "
+            "(4.43.1 is the validated version; 4.45 moved RoPE to position_ids and dropped "
+            "Cache.get_usable_length). Install requirements-model.txt")
     args.output_dir.mkdir(parents=True, exist_ok=False)
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from transformers.cache_utils import DynamicCache
