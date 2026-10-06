@@ -1,4 +1,10 @@
 from dataclasses import dataclass
+
+def Mapping_stat_ebb(activation, spec, in_features, out_features, config, weight_bits=8):
+    """Separate MulTCIM-inspired bounds; never reuse Asyn-CIM popcount ratios."""
+    from .ebb import measure_ebb_mapping
+    return measure_ebb_mapping(activation, spec, in_features, out_features, config, weight_bits)
+
 from re import M, X
 from typing import Any, Optional, Tuple
 

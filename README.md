@@ -13,7 +13,8 @@ python -m scripts.profile_fp8_int4 --demo --output outputs/fp8_int4_demo.json
 默认关闭混精。需要严格 IA FP8 / W INT4 时使用 `mixed_precision=False`、`outlier_ratio=0`。数值仿真使用浮点运算表达量化后的网格，不包含原生 INT4 kernel 或打包存储实现。
 
 - [FP8/INT4 修复与使用说明](docs/fp8_int4_path.md)
+- [EBB-CIM / MulTCIM 统计与本地运行](docs/ebb_cim.md)
 - [每次提交的修改记录](CHANGELOG.md)
 - [提交维护规则](AGENTS.md)
 
-公开快照的 `0104_single_sample_inference.py` 还依赖未提交的完整模型包装器和数据/评估模块；本次没有用过期附件覆盖这些缺失模块。核心接口和单 Linear 工作负载脚本可以独立运行。完整 Qwen checkpoint 推理、PPL 和 GPU 验证尚未完成。
+Qwen 包装器与校准加载器已经上传。全模型依赖见 `requirements-model.txt`；EBB 使用独立的 `scripts.profile_ebb` 入口和 `qwen2_14b_ebb_f8i4.yaml` 配置，默认收集 8192 prefill＋1024 decode。EBB 输出是基于显式 FP8 对齐和调度假设的 GEMM 周期范围，不是论文测得的 FP8 性能或端到端时延。完整 14B checkpoint 与 CUDA 实验需本地运行。

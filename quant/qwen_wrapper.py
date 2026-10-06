@@ -13,6 +13,7 @@ from .quant_linear import QuantizedLinear
 from .quant_matmul import QuantizedMatMul
 from .stat_manager import QuantStatManager
 from .opt_wrapper import create_quantized_linear, create_quantized_matmul
+from .quant_spec import quant_awo
 
 
 QWEN_ATTN_LINEAR_NAMES = ["q_proj", "k_proj", "v_proj", "o_proj"]
@@ -202,7 +203,20 @@ def inject_qwen_quantized_matmul(
         )
 
         # 3. KV cache update
+        cache_length_before = 0
         if cache_obj is not None:
+            if hasattr(cache_obj, "get_seq_length"):
+                cache_length_before = int(cache_obj.get_seq_length(attention_module.layer_idx))
+            # FP8 cache semantics, emulated with dequantized values in HF Cache.
+            # Quantize only the NEW entries after RoPE, before cache.update.
+            cache_cfg = quant_config.get("kv_cache", {})
+            if cache_cfg.get("fp8_static", False) and qk_matmul.mode == "quant_forward":
+                qk_matmul._load_scales()
+                pv_matmul._load_scales()
+                key_states = (quant_awo(key_states, qk_matmul.B_interval, qk_matmul.B_spec,
+                              out_dtype=torch.float32) * qk_matmul.B_interval).to(key_states.dtype)
+                value_states = (quant_awo(value_states, pv_matmul.B_interval, pv_matmul.B_spec,
+                                out_dtype=torch.float32) * pv_matmul.B_interval).to(value_states.dtype)
             cache_kwargs = {
                 "sin": sin,
                 "cos": cos,
@@ -234,6 +248,17 @@ def inject_qwen_quantized_matmul(
         )
 
         kv_seq_len = key_states.shape[-2]
+
+        manager = attention_module.stat_manager
+        if manager is not None and hasattr(manager, "set_attention_context"):
+            manager.set_attention_context(layer_idx,
+                q_heads=num_heads, kv_heads=num_key_value_heads, head_dim=head_dim,
+                query_length=q_len, cache_length_before=cache_length_before,
+                cache_length_after=kv_seq_len,
+                shared_kv_gqa=quant_config.get("shared_kv_gqa", True),
+                kv_cache_encoding=("fp8_static_dequantized_emulation" if
+                    quant_config.get("kv_cache", {}).get("fp8_static", False)
+                    else "quantize_on_matmul_read"))
 
         # 5. QK quantized matmul
         # 老版本 Qwen2Attention 用 / sqrt(head_dim)，不一定有 attention_module.scaling。

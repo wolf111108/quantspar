@@ -141,7 +141,8 @@ class QuantStatManager:
 
     def __init__(self, scale_dir: str, nmacro: int = 32, as_l: int = 1, *,
                  h: int = 64, w: int = 48, banks: int = 16,
-                 bit_scope: str = "mantissa", cycles_per_effective_bit: float = 1):
+                 bit_scope: str = "mantissa", cycles_per_effective_bit: float = 1,
+                 ebb_config=None):
         """
         Initialize statistics manager.
 
@@ -161,6 +162,12 @@ class QuantStatManager:
         self.cim_geometry = dict(height=int(h),width=int(w),banks=int(banks),macros=self.nmacro)
         self.bit_scope = bit_scope
         self.cim_records = []
+        self.ebb_stats = None
+        self.execution_context = {}
+        self.attention_context = {}
+        if ebb_config is not None and ebb_config.get("enabled", True):
+            from .ebb import EBBConfig, EBBStats
+            self.ebb_stats = EBBStats(EBBConfig.from_dict(ebb_config), ebb_config.get("trace_path"))
         self._static_weights_seen = set()
         self.stats: Dict[str, QuantStatistics] = {}
         self.hooks: List[Any] = []
@@ -339,7 +346,30 @@ class QuantStatManager:
             raise ValueError(f"Unknown sparsity phase: {phase}")  #add
         self.current_phase = phase  #add
 
+    def set_step(self, step, cache_length_before=0, **metadata):
+        """Explicit inference-call provenance; decode cache grows every step."""
+        if step < 0 or cache_length_before < 0:
+            raise ValueError("step and cache length must be nonnegative")
+        self.execution_context = dict(step=int(step), cache_length_before=int(cache_length_before),
+                                      **metadata)
+        self.attention_context.clear()
+
+    def set_attention_context(self, layer_idx, **metadata):
+        for name in ("qk_matmul", "pv_matmul"):
+            self.attention_context[(name, layer_idx)] = dict(metadata)
+
+    def export_ebb_stats(self, path, workload=None):
+        if self.ebb_stats is None:
+            raise ValueError("EBB backend is not enabled")
+        return self.ebb_stats.export(path, workload)
+
+    def close(self):
+        if self.ebb_stats is not None:
+            self.ebb_stats.close()
+
     def reset_sparsity(self):  #add
+        if self.ebb_stats is not None:
+            raise ValueError("Use a new EBB manager per run; reset would invalidate streamed trace")
         self.cim_records.clear();self._static_weights_seen.clear();self.per_layer_latency.clear()
         for prefix in ('activation','weight','dynamic_weight'):
             for suffix in ('zero_count','element_count','bit_count','0bit_count','sparsebit_count',
@@ -2233,6 +2263,12 @@ class QuantStatManager:
                                  weight,weight_spec,spec,digit_size,parallelism,
                                  in_features,out_features):
         if activation is None or spec is None or spec.kind == "none": return
+        if self.ebb_stats is not None:
+            context = dict(self.execution_context)
+            context.update(self.attention_context.get((layer_name, layer_idx), {}))
+            return self.ebb_stats.collect(layer_name, layer_idx, activation, weight,
+                                          spec, weight_spec, in_features, out_features,
+                                          self.current_phase, context)
         self.record_collected_layer_name(layer_name,layer_idx)
         sparse=sparse_counts(activation,spec,self.bit_scope,chunk_size=self.sparse_stat_chunk_size)
         self.collect_activation_sparsity(*sparse)
@@ -2279,6 +2315,8 @@ class QuantStatManager:
         entry['speed_up']=entry['baseline_latency']/entry['SACIM_latency'] if entry['SACIM_latency']>0 else None
 
     def export_cim_stats(self,path):
+        if self.ebb_stats is not None:
+            raise ValueError("EBB results require export_ebb_stats, not the Asyn-CIM schema")
         import json
         from pathlib import Path
         doc=dict(schema_version=1,bit_scope=self.bit_scope,geometry=self.cim_geometry,
@@ -2295,6 +2333,8 @@ class QuantStatManager:
         This is one average per operator/phase, not a per-layer/context trace.
         Missing operators, all-zero costs and unmatched GQA are rejected.
         """
+        if self.ebb_stats is not None:
+            raise ValueError("The Asyn-CIM LLMCompass bridge cannot import EBB bounds")
         import json
         from pathlib import Path
         if self.as_l!=1: raise ValueError("LLMCompass import requires asynchronous mapping")

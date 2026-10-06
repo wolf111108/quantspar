@@ -20,18 +20,17 @@ from quant.quant_linear import QuantizedLinear
 from quant.quant_matmul import QuantizedMatMul
 
 def _load_full_model_dependencies():
-    """The public snapshot lacks full-model wrappers/data modules; fail clearly."""
+    """Load optional full-model dependencies after argument parsing."""
     try:
         from tqdm import tqdm
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from quant.model_wrapper import wrap_model_by_family
         from quant.qwen_wrapper import switch_quantization_mode_all
         from others.data import CalibrationDataLoader
-        from others.evaluation import evaluate_perplexity
     except ImportError as exc:
         raise RuntimeError(
             "Full-model entry requires transformers, quant.model_wrapper, "
-            "quant.qwen_wrapper and others.data/evaluation from the complete project. "
+            "quant.qwen_wrapper and others.data from the complete project. "
             "Use python -m scripts.profile_fp8_int4 for the self-contained core path."
         ) from exc
     globals().update({name:value for name,value in locals().items() if not name.startswith('_')})
