@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-06 — Add offline Fig16 capacity and bandwidth latency estimates
+
+- 目的：增加不加载 14B、不采集真实操作数的另一种估算方法，按 Fig.16 Qwen2.5-14B 倍率、各架构原生计算资源与片外带宽估计 2048 prefill＋256 decode 的条件时延。
+- 内容：新增标准库离线入口、五架构 JSON 资源配置、使用说明与 README 索引。Fig.16 使用 SIGMA/BitWave/EBB-CIM/Bit-Pragmatic/Asyn-CIM 的 1.58/1.58/2.71/3.33/4.01 倍；明确 Bitlet/Slim-Llama 不在该图。分别按 MAC、SMM、PIP 和 CIM bank 语义推导 dense 16.384/0.256/2.2528/依频率/8.192 TOPS，不重复使用已含稀疏收益的峰值。保存来源、buffer、片内带宽说明、缺失片外带宽/Pragmatic 频率和显式覆盖。按 GQA 的 query compute/physical KV traffic、完整因果 attention shape、逐 decode cache 增长计算工作量；逐算子合并 full/no overlap，保存 dense/fig16 对照、逐阶段/算子/step、JSON/CSV、Git provenance。支持 W4/KV 搬运与额外一次 activation/output IO 两种情景；兼容现有 remaining-cost JSON，若附 workload 则验证长度，没有其他成本不生成 E2E。
+- 验证：Python 标准库和 python -S 下 6 项测试通过，覆盖独立 Qwen 参数/FLOPs/GQA 字节公式、decode 的前后 cache 边界、原生 dense 推导、逐算子标量 roofline、倍率仅改变计算、其他成本相加/shape 拒绝、缺失参数为 null、零 decode、非法数值、CLI 覆盖/provenance、输出保护和无模型依赖。实际执行 2048＋256 离线计算器：原生 SIGMA 1024 GB/s、Asyn 1000 GB/s 的乐观 GEMM/IO 为 3.954790/3.518821 s；另外执行共同 1000 GB/s 和 Pragmatic 1 GHz 的显式假设情景。语法与 diff 检查在提交前完成。
+- 限制与旧结果影响：未运行完整 Qwen、GPU、RTL或物理芯片；平均 Fig.16 比例从 8192 外推到所有算子和 prefill/decode，Asyn 4.01 还可能保留原来源 I/O 损失。BitWave/EBB/Pragmatic 使用原生整数容量代理 FP8，未验证实际对齐位宽/多 pass 或转换成本；utilization=1 是乐观容量假设，原始 token 并行可能无法用于 batch-one decode。配置记录 buffer/片内 feed，但没有实现 residency/refill、metadata、bank/NoC/control/spill；两种重叠情景不是物理保证上下界。部分原生时钟/片外带宽缺失，没有静默借用；other 成本仍需按 2048＋256 的 LLMCompass 设置提供。原量化、stat manager、所有实际操作数 collector、scale 和既有输出 schema 均未改，旧结果不会自动获得 Fig.16 数据，不应与新容量代理数值混称相同精度的原生性能。
+
 ## 2026-10-06 — Add Slim-Llama to joint architecture profiling
 
 - 目的：在同一次 Qwen2.5-14B IA FP8 / Linear W INT4、2048＋256 实验中增加 Slim-Llama，使 Bitlet、BitWave 和 Slim-Llama 共用实际量化操作数、校准与推理。

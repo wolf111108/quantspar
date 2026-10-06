@@ -17,8 +17,18 @@ python -m scripts.profile_fp8_int4 --demo --output outputs/fp8_int4_demo.json
 - [Bitlet 论文参数、2048＋256 采集与时延估计](docs/bitlet.md)
 - [一次推理同时统计 Bitlet / BitWave / Slim-Llama](docs/bitlet_bitwave.md)
 - [Slim-Llama 聚类、S-LUT 与访存估计口径](docs/slimllama.md)
+- [Fig.16 倍率、原生计算容量与带宽的离线时延估算](docs/paper_fig16_latency.md)
 - [每次提交的修改记录](CHANGELOG.md)
 - [提交维护规则](AGENTS.md)
+
+直接使用论文 Fig.16 倍率估计，无需加载 14B 或安装模型依赖：
+
+~~~bash
+python -m scripts.estimate_paper_latency \
+  --output-dir outputs/paper_fig16_2048_256
+~~~
+
+默认同时输出 SIGMA、BitWave、EBB-CIM、Bit-Pragmatic、Asyn-CIM 的 dense 容量、2048＋256 工作量、计算与带宽情景。Bitlet/Slim-Llama 不在 Fig.16；缺失的时钟、片外带宽或剩余算子耗时保持 null。可显式覆盖带宽/频率并复用 other-latency JSON 得到条件 E2E，命令和原生 FP8 支持限制见说明文档。
 
 一次校准与推理同时获取 Bitlet、BitWave、Slim-Llama 的独立统计：
 
