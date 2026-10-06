@@ -8,6 +8,14 @@ python -m unittest discover -s tests -v
 python -m scripts.profile_fp8_int4 --demo --output outputs/fp8_int4_demo.json
 ```
 
+完整 Qwen Asyn-CIM FP8/W4 的256＋32统计与LLMCompass导入：
+
+```bash
+python -m scripts.profile_asyn_cim --model-path /path/to/Qwen2.5-14B --output-dir outputs/asyn_cim_256_32
+```
+
+输出逐阶段/算子mapped compute speedup和独立的 `llmcompass_speedups.json`。decode按共享KV分组，完整覆盖后才导出桥接文件；默认16 macros、64×48、16 banks、0MMM。命令、复用scales、SMMM口径、后端W4/FP8搬运与32次decode对应output-length33的约定见[Asyn-CIM采集说明](docs/asyn_cim.md)。
+
 `--demo` 是合成张量的接口示例，不是 Qwen 推理结果。真实 Linear 工作负载可以通过 `--tensor-file` 输入包含 `activation`、`weight` 和可选 `bias` 的张量字典。
 
 默认关闭混精。需要严格 IA FP8 / W INT4 时使用 `mixed_precision=False`、`outlier_ratio=0`。数值仿真使用浮点运算表达量化后的网格，不包含原生 INT4 kernel 或打包存储实现。

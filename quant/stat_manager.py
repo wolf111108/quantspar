@@ -142,7 +142,8 @@ class QuantStatManager:
     def __init__(self, scale_dir: str, nmacro: int = 32, as_l: int = 1, *,
                  h: int = 64, w: int = 48, banks: int = 16,
                  bit_scope: str = "mantissa", cycles_per_effective_bit: float = 1,
-                 ebb_config=None, bitlet_config=None, bitwave_config=None, slimllama_config=None):
+                 ebb_config=None, bitlet_config=None, bitwave_config=None, slimllama_config=None,
+                 cache_static_weight_counts=False):
         """
         Initialize statistics manager.
 
@@ -162,6 +163,8 @@ class QuantStatManager:
         self.cim_geometry = dict(height=int(h),width=int(w),banks=int(banks),macros=self.nmacro)
         self.bit_scope = bit_scope
         self.cim_records = []
+        self.cache_static_weight_counts = cache_static_weight_counts
+        self._static_weight_counts = {}
         self.ebb_stats = None
         self.bitlet_stats = None
         self.bitwave_stats = None
@@ -417,6 +420,7 @@ class QuantStatManager:
         if self.ebb_stats is not None or self.bit_architecture_collectors:
             raise ValueError("Use a new architecture manager per run; reset would invalidate streamed trace")
         self.cim_records.clear();self._static_weights_seen.clear();self.per_layer_latency.clear()
+        self._static_weight_counts.clear()
         for prefix in ('activation','weight','dynamic_weight'):
             for suffix in ('zero_count','element_count','bit_count','0bit_count','sparsebit_count',
                            'amplitude_zero_bits_total','amplitude_bit_count'):
@@ -2324,12 +2328,30 @@ class QuantStatManager:
                                           spec, weight_spec, in_features, out_features,
                                           self.current_phase, context)
         self.record_collected_layer_name(layer_name,layer_idx)
+        context = dict(self.execution_context)
+        context.update(self.attention_context.get((layer_name, layer_idx), {}))
+        input_shape = list(activation.shape)
+        # Qwen numerical attention expands KV to Q heads. For decode, pack
+        # queries sharing one KV operand into M, matching LLMCompass GQA.
+        attention=layer_name in {"qk_matmul","pv_matmul","qk_matmul_A","pv_matmul_A"}
+        if attention and self.current_phase == "decode" and context.get("shared_kv_gqa"):
+            q, kv = context["q_heads"], context["kv_heads"]
+            if q % kv or activation.ndim != 4 or weight.ndim != 4 or activation.shape[1] != q or weight.shape[1] != q:
+                raise ValueError("Invalid expanded-head decode GQA operands")
+            group = q // kv
+            activation = activation.reshape(activation.shape[0], kv,
+                                            group * activation.shape[-2], activation.shape[-1])
+            weight = weight.reshape(weight.shape[0], kv, group,
+                                    weight.shape[-2], weight.shape[-1])[:, :, 0]
         sparse=sparse_counts(activation,spec,self.bit_scope,chunk_size=self.sparse_stat_chunk_size)
         self.collect_activation_sparsity(*sparse)
         self.collect_unit_sparsity(layer_name,layer_idx,activation,spec)
-        attention=layer_name in {"qk_matmul","pv_matmul","qk_matmul_A","pv_matmul_A"}
-        wt=sparse_counts(weight,weight_spec,"storage",chunk_size=self.sparse_stat_chunk_size)
         key=(self.current_phase,layer_name,layer_idx,weight_spec.name())
+        wt = self._static_weight_counts.get(key) if self.cache_static_weight_counts and not attention else None
+        if wt is None:
+            wt=sparse_counts(weight,weight_spec,"storage",chunk_size=self.sparse_stat_chunk_size)
+            if self.cache_static_weight_counts and not attention:
+                self._static_weight_counts[key] = wt
         if attention: self.collect_dynamic_weight_sparsity(*wt)
         elif key not in self._static_weights_seen:
             self.collect_weight_sparsity(*wt);self._static_weights_seen.add(key)
@@ -2339,7 +2361,7 @@ class QuantStatManager:
         result=measure_mapping(cim,mapped_activation,spec,in_features,out_features,
                                self.current_phase!="decode",self.bit_scope,bool(self.as_l))
         result.update(layer_name=layer_name,layer_idx=layer_idx,phase=self.current_phase,
-                      input_shape=list(activation.shape),
+                      input_shape=input_shape, context=context,
                       weight_format=weight_spec.name(),activation_format=spec.name(),
                       geometry=self.cim_geometry.copy(),weight_sparsity=dict(
                           elements=wt[0],zero_elements=wt[1],bits=wt[2],zero_bits=wt[3]),
@@ -2379,6 +2401,7 @@ class QuantStatManager:
                  records=self.cim_records)
         destination=Path(path);destination.parent.mkdir(parents=True,exist_ok=True)
         destination.write_text(json.dumps(doc,indent=2,allow_nan=False)+"\n")
+        return doc
 
 
     def export_llmcompass_manifest(self,path,workload,source_commit):
@@ -2443,8 +2466,15 @@ class QuantStatManager:
                  ratio_semantics="LLMCompass capacity denominator / measured mapped bit steps",
                  approximation="one weighted operator average per phase; no layer/context trace",
                  weight_format="INT4 must be configured separately for LLMCompass memory traffic")
+        if all(r['activation_format'] == 'e4m3' and r['weight_format'] ==
+               ('e4m3' if r['layer_name'] in ('qk_matmul', 'pv_matmul') else 'int4')
+               for r in self.cim_records):
+            doc['transport'] = dict(linear_weight_storage_bits=4, kv_storage_bits=8,
+                                    local_linear_weight_storage_bits=8,
+                                    local_weight_note="W4 transported packed; one byte per local CIM coefficient is an explicit backend assumption")
         destination=Path(path);destination.parent.mkdir(parents=True,exist_ok=True)
         destination.write_text(json.dumps(doc,indent=2,allow_nan=False)+"\n")
+        return doc
 
     def _split_unit_layer_key(self, layer_key: str):  #add
         """  #add
@@ -2882,4 +2912,3 @@ class QuantStatManager:
         for hook in self.hooks:
             hook.remove()
         self.hooks.clear()
-

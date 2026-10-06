@@ -2,6 +2,14 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+
+## 2026-10-06 — Fix Qwen Asyn-CIM profiling and LLMCompass export
+
+- 目的：让严格 IA E4M3/W INT4 的 Qwen 256＋32 完整采集并导出匹配当前 LLMCompass 的计算倍率。
+- 内容：新增专用短配置与入口；decode 按共享 KV 重新组织统计 operand，数值 forward 保持原样；记录逐调用上下文、完整覆盖和中断状态；输出纯稀疏倍率及单独 capacity bridge 文件。专用 immutable-weight 推理可缓存静态 W 编码计数，单位稀疏额外扫描关闭。声明 Linear packed W4、FP8 KV 和本地一字节权重写入假设。
+- 验证：真实PyTorch 2.6.0+cpu、Transformers4.43.1下全套77项测试通过；新增3项覆盖两层小Qwen的256＋32、一次真实校准、greedy/reuse、中断无manifest、共享KV与独立packed映射。实际manifest成功导入当前后端，并通过Figure10 CLI生成完整32个decode context的报告，未使用Torch/SCALEsim占位。修改文件语法与diff检查通过。
+- 限制与旧结果影响：未运行完整14B、CUDA、PPL或芯片；默认0MMM不含hidden-one/指数对齐；旧展开head decode倍率与新的shared-KV结果不可混用。bridge为逐phase/operator加权平均，非逐layer/context系统轨迹；32 decode forward应配合LLMCompass输出33token、stride1。静态缓存只用于不可变权重/scale。
+
 ## 2026-10-06 — Add short online profiles and calibrated offline latency extrapolation
 
 - 目的：用 256＋32 在线采集当前量化数据，再按目标 shape 重新计算长序列 GEMM/最低搬运量，减少完整长序列 collector 开销，提供类似 quantspar＋LLMCompass 的数据/系统分工。
@@ -78,4 +86,3 @@
 - 内容：加入 mapping、quant_linear、quant_matmul、stat_manager 和单样本脚本共 5 个文件。
 - 验证：本次按 Git 内容补录；不代表初始通路已通过完整执行验证。
 - 限制：该快照缺少导入模块，且数值/统计/映射存在上述后续修复的问题。
-
