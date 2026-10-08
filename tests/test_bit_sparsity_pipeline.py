@@ -250,7 +250,7 @@ class SavedModelPipelineTests(unittest.TestCase):
                             self.assertEqual(row['observations'], expected_calls)
                     self.assertFalse((root/'stats/unit_sparsity').exists())
                     text = next((root/'reports').glob('*.txt')).read_text()
-                    self.assertIn('ppl: sum zero bits', text)
+                    self.assertIn('full_forward: sum zero bits', text)
                     self.assertIn('prefill_decode: sum zero bits', text)
                     self.assertIn('Perplexity:', text)
                     if masked:

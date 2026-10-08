@@ -716,7 +716,7 @@ def evaluate(args, config, model):
 
         stat_manager.print_global_sparsity("PPL FULL-FORWARD OPERAND SPARSITY")
         stat_manager.print_operand_sparsity(["full_forward"])
-        sparsity_summaries["ppl"] = _export_bit_sparsity(
+        sparsity_summaries["full_forward"] = _export_bit_sparsity(
             args, stat_manager, "full_forward", ["full_forward"])
 
         stat_manager.print_collected_layer_names(  #add
