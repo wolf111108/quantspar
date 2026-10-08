@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import yaml
 
@@ -178,6 +179,25 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(self.run_matrix(args), 0)
         self.assertEqual(len(self.calls), 5)  # Nonempty corruption is detected by checksum.
 
+    def test_qk_pv_outlier_ratio_override_changes_fingerprint_and_config(self):
+        base = self.args("--formats", "fp8_int4")
+        self.assertEqual(self.run_matrix(base), 0)
+        with_qk = self.args("--formats", "fp8_int4", "--qk-pv-outlier-ratio", "0.0002")
+        self.assertEqual(self.run_matrix(with_qk), 0)
+        self.assertEqual(len(self.calls), 2)
+        jobs = sorted((self.output / "jobs").glob("opt_1.3b_fp8_int4/attempt_*"))
+        self.assertEqual(len(jobs), 2)
+        plain = yaml.safe_load((jobs[0] / "config.yaml").read_text())
+        overridden = yaml.safe_load((jobs[1] / "config.yaml").read_text())
+        self.assertEqual(plain["quantization"]["qk_matmul"]["outlier_ratio"], 0)
+        self.assertEqual(overridden["quantization"]["qk_matmul"]["outlier_ratio"], 0.0002)
+        self.assertEqual(overridden["quantization"]["pv_matmul"]["outlier_ratio"], 0.0002)
+        self.assertEqual(overridden["quantization"]["q_proj"]["outlier_ratio"], 0.0001)  # Linear untouched
+        rows = self.summary()
+        self.assertEqual(len(rows), 1)  # Same run_name: the manifest keeps only the latest attempt.
+        self.assertEqual(float(rows[0]["qk_pv_outlier_ratio"]), 0.0002)
+        self.assertEqual(rows[0]["attempt"].endswith("attempt_0002"), True)
+
     def test_failure_and_nonfinite_ppl_continue_without_fake_zero(self):
         args = self.args("--formats", "bf16_bf16", "fp8_fp8", "int8_int8")
         outcomes = {"opt_1.3b_bf16_bf16": "fail", "opt_1.3b_fp8_fp8": float("inf")}
@@ -197,6 +217,136 @@ class MatrixTests(unittest.TestCase):
             raise KeyboardInterrupt
         self.assertEqual(self.run_matrix(self.args(), interrupted), 130)
         self.assertEqual([row["status"] for row in self.summary()], ["interrupted", "pending"])
+
+    def test_doubling_stops_when_all_groups_meet_threshold(self):
+        from scripts import run_sparsity_ppl_doubling as doubling
+        checkpoint = self.checkpoint
+        script_ppl = {"opt_1.3b_bf16_bf16": 5.0, "opt_1.3b_fp8_int4": 60.0}
+        invocations = []
+
+        def executor(command, *, cwd, stdout, stderr, check):
+            invocations.append(command)
+            return self.executor(command, cwd=cwd, stdout=stdout, stderr=stderr, check=check)
+
+        base = doubling.parse_args([
+            "--models", "opt-1.3b", "--formats", "bf16_bf16", "fp8_int4",
+            "--opt-1-3b-path", str(checkpoint), "--ppl-threshold", "20",
+            "--output-dir", str(self.root / "doubling")])
+
+        def patched_runner(argv=None):
+            args = runner.parse_args(argv)
+            outcomes = {name: script_ppl[name] for name in script_ppl
+                        if runner.MODELS[args.models[0]][0] in name and args.formats[0] in name}
+            # Only the selected single (model, format) job runs this invocation.
+            selected = f"{runner.MODELS[args.models[0]][0]}_{args.formats[0]}"
+            outcome = script_ppl[selected]
+            def exec_one(command, *, cwd, stdout, stderr, check):
+                self.calls.append(command)
+                value = lambda flag: command[command.index(flag) + 1]
+                run_name = value("--run-name")
+                self.assertEqual(run_name, selected)
+                return self.executor(command, cwd=cwd, stdout=stdout, stderr=stderr, check=check,
+                                     outcomes={run_name: outcome})
+            return runner.run_matrix(args, executor=exec_one)
+
+        # Drive the loop with a stubbed runner entry.
+        calls = []
+        real_run_matrix = runner.run_matrix
+
+        def value_of(command, flag):
+            return command[command.index(flag) + 1]
+
+        def fake_run_matrix(runner_args, executor=None):
+            calls.append(runner_args)
+            selected = f"{runner.MODELS[runner_args.models[0]][0]}_{runner_args.formats[0]}"
+            def exec_one(command, *, cwd, stdout, stderr, check):
+                self.calls.append(command)
+                return self.executor(command, cwd=cwd, stdout=stdout, stderr=stderr, check=check,
+                                     outcomes={value_of(command, "--run-name"): script_ppl[selected]})
+            return real_run_matrix(runner_args, executor=exec_one)
+
+        with mock.patch.object(doubling.runner, "run_matrix", new=fake_run_matrix), \
+             contextlib.redirect_stdout(io.StringIO()):
+            # Round 1: fp8_int4 fails (60 > 20); later rounds keep doubling while it stays 60.
+            code = doubling.run_doubling(base)
+            self.assertEqual(code, 1)  # bf16 fine, fp8_int4 never converges at fixed PPL 60
+        # Round 1 dispatches both groups (2 calls); rounds 2..8 dispatch only fp8_int4 (7 calls).
+        self.assertEqual(len(calls), 2 + 7)
+        self.assertEqual([a.formats[0] for a in calls[:2]], ["bf16_bf16", "fp8_int4"])
+        self.assertEqual([a.formats[0] for a in calls[2:]], ["fp8_int4"] * 7)
+        self.assertEqual(calls[2].outlier_ratio, 0.0001)  # None default -> seed ratio
+        self.assertEqual(calls[2].qk_pv_outlier_ratio, 0.0001)
+        self.assertEqual(calls[3].outlier_ratio, 0.0002)
+        self.assertEqual(calls[-1].outlier_ratio, min(0.0001 * 2 ** 6, 0.1))  # round 8 = 6th doubling
+        rows = list(csv.DictReader((self.root / "doubling" / "doubling_summary.csv").open()))
+        by_name = {r["run_name"]: r for r in rows}
+        self.assertEqual(by_name["opt_1.3b_bf16_bf16"]["final_ppl"], "5.0")
+        self.assertEqual(by_name["opt_1.3b_bf16_bf16"]["rounds"], "1")
+        self.assertEqual(by_name["opt_1.3b_fp8_int4"]["final_ppl"], "60.0")
+        self.assertEqual(by_name["opt_1.3b_fp8_int4"]["rounds"], "8")  # hit --max-rounds
+
+        # Now make the second run converge: first invocation 60, later ones 15.
+        script_ppl["opt_1.3b_fp8_int4"] = 15.0
+        calls.clear()
+        original_executor = self.executor
+        attempt_count = {"n": 0}
+        real_run2 = real_run_matrix
+
+        def fake_run_matrix2(runner_args, executor=None):
+            calls.append(runner_args)
+            selected = f"{runner.MODELS[runner_args.models[0]][0]}_{runner_args.formats[0]}"
+
+            def exec_one(command, *, cwd, stdout, stderr, check):
+                self.calls.append(command)
+                run_name = value_of(command, "--run-name")
+                if run_name == "opt_1.3b_fp8_int4":
+                    attempt_count["n"] += 1
+                outcome = 60.0 if run_name == "opt_1.3b_fp8_int4" and attempt_count["n"] == 1 else script_ppl[run_name]
+                return self.executor(command, cwd=cwd, stdout=stdout, stderr=stderr, check=check,
+                                     outcomes={run_name: outcome})
+            return real_run2(runner_args, executor=exec_one)
+
+        with mock.patch.object(doubling.runner, "run_matrix", new=fake_run_matrix2), \
+             contextlib.redirect_stdout(io.StringIO()):
+            code = doubling.run_doubling(base)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 3)  # round 1 both; round 2 only fp8_int4 (60->15)
+        rows = list(csv.DictReader((self.root / "doubling" / "doubling_summary.csv").open()))
+        by_name = {r["run_name"]: r for r in rows}
+        self.assertEqual(by_name["opt_1.3b_fp8_int4"]["final_ppl"], "15.0")
+        self.assertEqual(by_name["opt_1.3b_fp8_int4"]["final_linear_outlier_ratio"], "0.0001")
+        self.assertEqual(by_name["opt_1.3b_fp8_int4"]["rounds"], "2")
+        self.assertEqual(by_name["opt_1.3b_bf16_bf16"]["rounds"], "1")
+        self.assertEqual(by_name["opt_1.3b_bf16_bf16"]["rounds"], "1")
+
+    def test_doubling_stops_at_ratio_cap(self):
+        from scripts import run_sparsity_ppl_doubling as doubling
+        calls = []
+        real_run_matrix = runner.run_matrix
+
+        def fake_run_matrix(runner_args, executor=None):
+            calls.append(runner_args)
+            def exec_one(command, *, cwd, stdout, stderr, check):
+                self.calls.append(command)
+                return self.executor(command, cwd=cwd, stdout=stdout, stderr=stderr, check=check,
+                                     outcomes={command[command.index("--run-name") + 1]: 60.0})
+            return real_run_matrix(runner_args, executor=exec_one)
+
+        base = doubling.parse_args([
+            "--models", "opt-1.3b", "--formats", "fp8_int4",
+            "--opt-1-3b-path", str(self.checkpoint), "--ppl-threshold", "20",
+            "--max-ratio", "0.0003", "--output-dir", str(self.root / "doubling_cap")])
+        with mock.patch.object(doubling.runner, "run_matrix", new=fake_run_matrix), \
+             contextlib.redirect_stdout(io.StringIO()):
+            code = doubling.run_doubling(base)
+        self.assertEqual(code, 1)  # never meets threshold
+        # Round 1 default -> round 2 linear None->1e-4, qk_pv 0->1e-4; round 3 ->2e-4;
+        # round 4 linear ->3e-4 (at cap), qk_pv ->4e-4 capped to 3e-4; round 5 exhausted, no call.
+        self.assertEqual(len(calls), 4)
+        rows = list(csv.DictReader((self.root / "doubling_cap" / "doubling_summary.csv").open()))
+        self.assertEqual(rows[0]["exhausted"], "True")
+        self.assertEqual(rows[0]["final_linear_outlier_ratio"], "0.0003")
+        self.assertEqual(rows[0]["final_qk_pv_outlier_ratio"], "0.0003")  # 2e-4 doubled, capped at 3e-4
 
     def test_ppl_only_does_not_require_pd_reports(self):
         self.assertEqual(self.run_matrix(self.args("--eval-flow", "ppl")), 0)

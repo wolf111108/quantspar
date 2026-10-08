@@ -59,6 +59,8 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/sparsity_ppl_rerun"))
     parser.add_argument("--outlier-ratio", type=outlier_ratio, default=None,
                         help="Override every Linear, including BF16; attention stays at zero")
+    parser.add_argument("--qk-pv-outlier-ratio", type=outlier_ratio, default=None,
+                        help="Override qk_matmul/pv_matmul outlier ratio (default keeps config values)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip only validated completed jobs with matching provenance")
     parser.add_argument("--dry-run", action="store_true",
@@ -104,6 +106,10 @@ def build_jobs(args):
                 for settings in config["quantization"].values():
                     if isinstance(settings, dict) and "a_bit" in settings:
                         settings["outlier_ratio"] = args.outlier_ratio
+            if args.qk_pv_outlier_ratio is not None:
+                for settings in config["quantization"].values():
+                    if isinstance(settings, dict) and "A_bit" in settings:
+                        settings["outlier_ratio"] = args.qk_pv_outlier_ratio
             fingerprint_input = {
                 **provenance, "config": config, "model_path": checkpoint,
                 "device": args.device, "eval_flow": args.eval_flow,
@@ -208,7 +214,7 @@ def save_results(output, manifest):
     write_json(output / "summary.json", {"schema_version": 1, "metric": METRIC, "jobs": rows})
     fields = ["run_name", "model", "format", "status", "ppl", "ppl_status", "ppl_raw_value",
               "eval_flow", "device", "seq_length", "max_eval_tokens", "linear_outlier_ratio",
-              "elapsed_seconds", "ppl_time_seconds"]
+              "qk_pv_outlier_ratio", "elapsed_seconds", "ppl_time_seconds"]
     fields += [f"{phase}_total_bit_zero_ratio" for phase in PHASES]
     fields += [f"{phase}_{operand}_bit_zero_ratio" for phase in PHASES for operand in OPERANDS]
     fields += ["returncode", "error", "report", "log", "attempt", "fingerprint"]
@@ -281,6 +287,7 @@ def run_matrix(args, executor=subprocess.run):
             "seq_length": config["evaluation"]["seq_length"],
             "max_eval_tokens": config["evaluation"]["max_eval_tokens"],
             "linear_outlier_ratio": config["quantization"]["q_proj"]["outlier_ratio"],
+            "qk_pv_outlier_ratio": config["quantization"]["qk_matmul"]["outlier_ratio"],
             "attempt": str(attempt), "log": str(attempt / "run.log"),
         }
         manifest["jobs"][job["run_name"]] = entry

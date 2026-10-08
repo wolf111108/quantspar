@@ -16,3 +16,9 @@
 - 验证：新增 9 项无模型依赖 unittest 全部通过，覆盖 15 配置实际 wrapper 层名/格式/上下文/数据预算与 scale 隔离、dry-run 无模型调用/无文件写入、完整 PPL 数值、加权计数与非有限 JSON、失败后继续/空值、resume 指纹变化及文件缺失/错误计数/详细文件 SHA256 损坏重跑、中断状态、PPL-only 和跨工作目录 Shell 入口。Python compileall、Shell bash -n 与 diff 检查通过。
 - 限制与旧结果影响：只使用合成报告和调度回调验证，没有在这里运行完整 checkpoint、FineWeb、CUDA 或真实 PPL，当前环境无 PyTorch/Transformers。FP 显式尾数、INT 补码、mask 零计入及 protected codes 排除口径保持不变；截图的指数对齐尾数脚注与本次不同，旧上传配置的 FP16/BF16、零 outlier、Qwen token 预算差异均在说明中明确，新结果不可直接混称旧设置。resume 校验路径/配置/代码/依赖，不计算 checkpoint 权重哈希；数值仿真不含原生低位 kernel 或硬件时延。既有 FP16 配置、默认 14B 配置与硬件 collector 未改。
 
+## 2026-10-08 — Add QK/PV outlier ratio override to sparsity PPL matrix
+
+- 目的：支持对 PPL 恶化组做加严 outlier 旁路对比实验——原 runner 的 `--outlier-ratio` 只覆盖 Linear，QK/PV MatMul 固定使用模板值，无法按用户要求同时把两者设为 0.0002。
+- 内容：`scripts/run_sparsity_ppl_matrix.py` 新增 `--qk-pv-outlier-ratio` 参数（复用 `outlier_ratio` 校验，仅覆盖 `qk_matmul`/`pv_matmul`，不触碰 Linear），覆盖值进入任务指纹；manifest entry 与 `summary.csv` 新增 `qk_pv_outlier_ratio` 列，与 `linear_outlier_ratio` 并列记录有效设置。`docs/sparsity_ppl_rerun.md` 补充该参数说明。
+- 验证：smtqt 环境下 `tests/test_sparsity_ppl_matrix.py`（新增覆盖测试，验证配置覆盖、指纹变化、manifest 只保留最新 attempt、summary 两列取值）与 `tests/test_bit_sparsity_pipeline.py` 全部通过。
+- 限制与旧结果影响：默认不传该参数时行为与旧版完全一致（QK/PV 保持模板值），旧结果不受影响。加严实验使用独立输出目录（Linear 与 QK/PV 均 0.0002，9 组：opt_1.3b×3、opt_6.7b×2、qwen2.5_7b×4），与主矩阵（0.0001/0）不可混表，对比时需注明两组旁路设置不同。

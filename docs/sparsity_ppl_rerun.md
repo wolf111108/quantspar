@@ -29,7 +29,7 @@ bash scripts/run_sparsity_ppl_matrix.sh \
   --output-dir outputs/sparsity_ppl_rerun
 ```
 
-也可以使用 `python -u -m scripts.run_sparsity_ppl_matrix`，参数相同。Shell 入口默认使用 `python`，可用 `PYTHON=/path/to/environment/bin/python` 指定环境；选择单张卡可在命令前设置 `CUDA_VISIBLE_DEVICES=0`。
+也可以使用 `python -u -m scripts.run_sparsity_ppl_matrix`，参数相同。Shell 入口默认使用 `python`，可用 `PYTHON=/path/to/environment/bin/python` 指定环境；选择单张卡可在命令前设置 `CUDA_VISIBLE_DEVICES=0`。**必须始终在同一个 conda 环境中启动矩阵（含 `--resume`）**：任务指纹包含运行环境依赖版本，混用环境会因缺 transformers Qwen2 模块立即失败，并把 manifest 指纹覆盖为错误环境的值，导致 `--resume` 无法识别已完成的任务。
 
 默认 `--eval-flow all`：每组重新校准，再运行 PPL full-forward 与独立的 teacher-forced prefill/decode，顺序启动一个模型子进程，退出后开始下一组。每组完整日志写入自己的 `run.log`，终端输出进度。某一组非零退出、缺报告或 PPL 非有限时，记录状态并继续后续组；最终有失败时脚本退出码为 1。Ctrl-C 保留已完成结果与当前 attempt，退出码为 130。
 
@@ -51,6 +51,17 @@ bash scripts/run_sparsity_ppl_matrix.sh \
 
 中断后原命令加 `--resume`。只跳过 PPL 有限、所需阶段/六类操作数均有计数、详细 JSON/CSV 完整且 SHA256 校验一致、checkpoint 路径/配置/代码/依赖版本指纹一致的 completed 项；失败、非有限、损坏或设置不同的项重新校准。默认不加 `--resume` 会重新运行全部选中项，每次创建 `attempt_0001`、`attempt_0002` 等新目录，保留历史文件。指纹不计算 checkpoint 权重文件哈希；如果在原路径替换权重，去掉 `--resume` 或使用新输出目录。
 
+也可以用翻倍驱动器自动执行"PPL 超阈值即把 Linear 与 QK/PV outlier 同时翻倍重跑"的循环，直到全部低于阈值或触及 `--max-ratio`/`--max-rounds`（届时该组标记 exhausted）：
+
+```bash
+PYTHON=/path/to/python bash scripts/run_sparsity_ppl_matrix.sh --help  # 环境要求同上
+python -m scripts.run_sparsity_ppl_doubling \
+  --opt-1-3b-path /path/to/opt-1.3b --opt-6-7b-path /path/to/opt-6.7b \
+  --qwen-7b-path /path/to/Qwen2.5-7B --ppl-threshold 20
+```
+
+每轮写入独立 `round_NN` 子目录（含该轮 manifest/summary），结束后顶层生成 `doubling_summary.csv`（每组最终 PPL、轮数、最终两 ratio、历史与 exhausted 标记）。注意 Qwen 在加严旁路下 PPL 反而恶化，翻倍循环对其可能无效并以上限终止。
+
 ## 数据与旁路设置
 
 统一使用 `HuggingFaceFW/fineweb`、`sample-10BT`、`train`、streaming、text 字段，校准 seed=23、64 样本、batch=1。PPL 对同一模型的五组使用相同数据筛选和 **65,536 输入 tokens 预算**；数据加载器从固定顺序流取前缀，校准 loader 使用带 seed 的 shuffle。
@@ -65,7 +76,7 @@ PPL 沿用分段评测，每段首 token 不计算 loss，末尾不足整段的 
 
 四个量化组的全部 Linear 默认 `outlier_ratio: 0.0001`，BF16 基线为 0，QK/PV 均为 0。所有格式都关闭 mixed precision。normal codes 按完整形状统计，**计入 mask 人为产生的零**，高精度 protected sidepath 数值参与 PPL forward，其 codes 不计入比特比例。带输入相关 mask 的 W 每次 forward 重计，无 mask 的静态 W 每阶段计一次。
 
-需要对照无旁路的实验，在原命令中加 `--outlier-ratio 0`，建议配合新的 `--output-dir`。该参数统一覆盖全部 Linear，包括 BF16，QK/PV 保持为零。
+需要对照无旁路的实验，在原命令中加 `--outlier-ratio 0`，建议配合新的 `--output-dir`。该参数统一覆盖全部 Linear，包括 BF16，QK/PV 保持为零。若需同时调整 QK/PV 的旁路比例，用 `--qk-pv-outlier-ratio`（同样进入指纹，仅覆盖 `qk_matmul`/`pv_matmul`，不影响 Linear）；`summary.csv` 的 `linear_outlier_ratio` 与 `qk_pv_outlier_ratio` 两列分别记录两者的有效值。
 
 模板使用独立 `quant/scales/sparsity_ppl_rerun/<模型>_<格式>/` 并强制 `calibration_policy.default: recalibrate`。批量脚本进一步将有效 YAML、scales、日志与结果放进每个 attempt 内，避免跨模型、跨格式、跨重跑复用旧 scales；不添加 `--skip-calibration`。
 
