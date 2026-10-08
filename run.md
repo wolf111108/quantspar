@@ -36,3 +36,8 @@ python -m scripts.profile_bit_arches \
   python -m scripts.profile_asyn_cim \
   --model-path /home/zyzhao/lfw_opt/models/Qwen2.5-14B \
   --output-dir outputs/asyn_cim_256_32
+
+bash scripts/run_sparsity_ppl_matrix.sh \
+  --opt-1-3b-path /home/zyzhao/lfw_opt/models/opt-1.3b \
+  --opt-6-7b-path /home/zyzhao/lfw_opt/models/opt-6.7b \
+  --qwen-7b-path /home/zyzhao/lfw_opt/models/Qwen2.5-7B

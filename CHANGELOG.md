@@ -22,3 +22,9 @@
 - 内容：`scripts/run_sparsity_ppl_matrix.py` 新增 `--qk-pv-outlier-ratio` 参数（复用 `outlier_ratio` 校验，仅覆盖 `qk_matmul`/`pv_matmul`，不触碰 Linear），覆盖值进入任务指纹；manifest entry 与 `summary.csv` 新增 `qk_pv_outlier_ratio` 列，与 `linear_outlier_ratio` 并列记录有效设置。`docs/sparsity_ppl_rerun.md` 补充该参数说明。
 - 验证：smtqt 环境下 `tests/test_sparsity_ppl_matrix.py`（新增覆盖测试，验证配置覆盖、指纹变化、manifest 只保留最新 attempt、summary 两列取值）与 `tests/test_bit_sparsity_pipeline.py` 全部通过。
 - 限制与旧结果影响：默认不传该参数时行为与旧版完全一致（QK/PV 保持模板值），旧结果不受影响。加严实验使用独立输出目录（Linear 与 QK/PV 均 0.0002，9 组：opt_1.3b×3、opt_6.7b×2、qwen2.5_7b×4），与主矩阵（0.0001/0）不可混表，对比时需注明两组旁路设置不同。
+## 2026-10-08 — Add iterative outlier-ratio doubling driver for sparsity PPL matrix
+
+- 目的：按用户要求自动化"每轮跑完检测 PPL，把大于阈值的组 outlier ratio 翻倍重跑，直到全部低于阈值"的实验流程，免去手工多轮调度。
+- 内容：新增 `scripts/run_sparsity_ppl_doubling.py`：第一轮按模板默认跑选中矩阵；每轮结束读取该轮 `summary.csv`，PPL 超过 `--ppl-threshold`（默认 20）的组在下轮单独调度并把 Linear 与 QK/PV outlier 同时翻倍（默认/零值起步用 `--seed-ratio`=0.0001，上限 `--max-ratio`=0.1，轮数上限 `--max-rounds`=8）；到上限仍不达标标记 exhausted 并停止。每轮独立 `round_NN` 目录，组级调度按单模型单格式调用底层 runner。最终输出 `doubling_summary.csv`：每组最终 PPL、达标状态、轮数、最终两 ratio、PPL 与 ratio 历史、exhausted 标记。退出码 0=全部达标，1=仍有超阈值组。
+- 验证：smtqt 环境下 `tests/test_sparsity_ppl_matrix.py` 新增 2 项测试（固定失败下的逐轮翻倍与 max-rounds 终止、第二轮收敛场景、cap 场景 exhausted 终止与封顶值），全套 21 项测试加 31 子测试通过。逻辑用合成 PPL 与调度桩验证，未跑真实模型。
+- 限制与旧结果影响：纯新增脚本，不改变既有 runner 行为与已产出结果。真实运行时 Qwen 组在 0.0002 已观测到 PPL 恶化（+6%~+26%），翻倍循环可能对其无效并最终以 exhausted/max-rounds 终止，属预期实验结论而非脚本故障；每轮全量校准+评测，15 组满矩阵多轮总耗时可观。
