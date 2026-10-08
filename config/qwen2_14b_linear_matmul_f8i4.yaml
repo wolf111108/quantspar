@@ -2,7 +2,7 @@ model:
   name: qwen2.5-14b
   family: qwen2
   path: models/Qwen2.5-14B
-  num_layers: 28
+  # The wrapper enumerates the checkpoint's actual layers.
 
   # MatMul 量化阶段必须用 eager。
   # 否则可能走 SDPA / FlashAttention，qk_matmul 和 pv_matmul patch 不一定生效。
@@ -16,15 +16,14 @@ quantization:
   quantize_linear: true
   quantize_matmul: true
 
-  # 新目录：Linear + MatMul 共用的 scale 目录。
-  # 先把 linear_int8_fineweb 里的 588 个 Linear scale 复制到这里，
-  # 然后本配置只新增 qk_matmul / pv_matmul 的 scale。
-  scale_dir: quant/scales/qwen/qwen/qwen2_14b_linear_matmul_f8i4/
+  # Strict FP8/INT4 run: recalibrate every operator without the old outlier sidepath.
+  # Do not copy INT8 or outlier-protected scales into this directory.
+  scale_dir: quant/scales/qwen2_14b_linear_matmul_f8i4_strict_v2/
+  mixed_precision: false
   calibration_policy:
     default: auto
     layer_policy:
-      # Linear 已经在 linear_int8_fineweb 里校准过。
-      # 这里复制过来后直接复用。
+      # Recalibrate Linear and MatMul scales for the actual configured formats.
       q_proj: recalibrate
       k_proj: recalibrate
       v_proj: recalibrate
@@ -33,7 +32,6 @@ quantization:
       up_proj: recalibrate
       down_proj: recalibrate
 
-      # MatMul 是新增的，需要重新校准。
       qk_matmul: recalibrate
       pv_matmul: recalibrate
 
@@ -44,7 +42,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0001
+    outlier_ratio: 0.0
     p: 4
 
   k_proj:
@@ -52,7 +50,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0001
+    outlier_ratio: 0.0
     p: 4
 
   v_proj:
@@ -60,7 +58,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0001
+    outlier_ratio: 0.0
     p: 4
 
   o_proj:
@@ -68,7 +66,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0001
+    outlier_ratio: 0.0
     p: 4
 
   gate_proj:
@@ -76,7 +74,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0001
+    outlier_ratio: 0.0
     p: 4
 
   up_proj:
@@ -84,7 +82,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0001
+    outlier_ratio: 0.0
     p: 4
 
   down_proj:
@@ -92,7 +90,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0001
+    outlier_ratio: 0.0
     p: 4
 
   qk_matmul:
@@ -158,7 +156,7 @@ prefill_decode_profile:
   min_doc_tokens: 4096
 
 unit_sparsity:
-  enabled: true
+  enabled: false
   bit_group_size: 2   # a: 每个 unit 的 bit 数量
   dim_group_size: 2   # b: 每个 unit 的维度数量
 
@@ -176,3 +174,4 @@ logging:
   tensorboard: false
   wandb: false
   wandb_project: qwen-quantization
+

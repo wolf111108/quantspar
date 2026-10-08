@@ -210,7 +210,7 @@ def evaluate_perplexity(
 
         try:
             with torch.no_grad():
-                lm_logits = model(batch).logits
+                lm_logits = model(batch, use_cache=False).logits
         except RuntimeError as exc:
             if i == 0:
                 _cuda_mem_probe("oom_during_forward")
@@ -501,7 +501,7 @@ def evaluate_perplexity_sliding_window(
         target_ids[:, :-trg_len] = -100
         
         with torch.no_grad():
-            outputs = model(input_ids, labels=target_ids)
+            outputs = model(input_ids, labels=target_ids, use_cache=False)
             neg_log_likelihood = outputs.loss * trg_len
         
         nlls.append(neg_log_likelihood)

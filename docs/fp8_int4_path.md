@@ -1,5 +1,7 @@
 # IA FP8 / W INT4 通路修复与使用
 
+以下审计表记录 2026-10-05 的核心模块修复。当前全模型比特统计入口、统一 A/W/KV 尾数口径、原生 FP16 和默认关闭 unit 见 [OPT/Qwen 比特稀疏度说明](bit_sparsity_pipeline.md)。
+
 ## 审计结论与修复
 
 基线为 main `ca07eb0`，只有 5 个源文件。原始通路不能直接作为可信的 FP8/INT4 量化与架构倍率统计流程。
@@ -40,7 +42,7 @@ INT4 codes 为 `[-8,7]`，对称 scale 使用 `max_abs/7.5`。FP8 先按 scale �
 
 调用顺序是校准 → `save_scales()` → `mode="quant_forward"`。开启 `dynamic_activation=True` 时每 token 在线计算 IA scale；W 和输出 scale 仍校准。`output_channel` 将 W scale 按输出通道分别校准。改变格式、granularity 或混精策略后需要重新校准，不能直接复用旧实验 scale。
 
-输出 `o_bit="none"` 表示输出不再量化，IA/W 仍量化。`"fp16"`/`"bf16"` 表示不增加输出量化，由输入/模型 dtype 决定实际返回 dtype。QK/PV 的动态 B 是 K/V 数据，不是 Linear 权重：通常 A/B 都设为 FP8，不应仅因 Linear W4 就把 K/V 改成 INT4。
+输出 `o_bit="none"` 表示输出不再量化，IA/W 仍量化。当前 `"fp16"` 会按原生 FP16 网格舍入输出，scale 必须为 1；完整 FP16 配置会加载 FP16 模型。`"bf16"` 保留原来的输出处理规则，由输入/模型 dtype 决定实际返回 dtype。QK/PV 的动态 B 是 K/V 数据，不是 Linear 权重：通常 A/B 都设为 FP8，不应仅因 Linear W4 就把 K/V 改成 INT4。
 
 ## 稀疏统计口径
 
@@ -62,7 +64,7 @@ stats.export_cim_stats("outputs/run1/cim.json")
 | sign_mantissa | 4：SMMM | 加上符号位，dense 计算和统计同时使用 4 位 |
 | storage | 8：SEEEEMMM | 原始存储编码统计；不能自动解释为 8 个硬件串行周期 |
 
-INT4 的存储稀疏度始终使用完整 4 位补码。元素级零值看实际 code 是否为零；非零值的尾数可以全零，例如 1.0。符号/存储口径保留有符号零的实际 sign 位。unit 稀疏使用同一编码和所选位宽，尾部 unit 补零，不删除尾部元素。
+INT4 的存储稀疏度始终使用完整 4 位补码。元素级零值看实际 code 是否为零；非零值的尾数可以全零，例如 1.0。符号/存储口径保留有符号零的实际 sign 位。当前 FP 权重及动态 K/V 与激活使用相同 bit_scope。unit 默认关闭；显式启用时使用同一编码和所选位宽，尾部 unit 补零，不删除尾部元素。
 
 映射不会用 `1/(1-bit_sparsity)` 替代真实负载：先取 bank 最大工作量，再按同步/异步规则聚合 macro。Linear 共享一组 W，batch/token 合并为 M；attention 的独立 B/H operand 串行执行。统计分块处理 operand/token-round，避免对完整 attention tensor 生成额外的大型 bit 轴。
 
@@ -110,8 +112,9 @@ python -m scripts.profile_fp8_int4 \
 
 ## 仍需补全的范围
 
-- 公开快照缺少 `quant.model_wrapper`、`quant.qwen_wrapper`、`others.data/evaluation`。旧全模型入口会给出明确依赖错误；它的帮助、阶段 JSON 导出和除零输出已修复，但完整推理依然需要原项目包装器/数据模块。本次没有将旧附件包装器当作当前实现。
-- 全模型层覆盖、GQA/KV cache 接入、Qwen checkpoint 精度/PPL、CUDA 数值和运行内存尚未验证。
+- 当前快照已包含 OPT/Qwen 包装器、`others.data` 和根目录 `perplexity.py`；全模型入口已接通这些模块，缺失的 BitNet/Qwen3.5/MoE 依赖暂时注释。
+- 层覆盖、GQA/KV cache 与 PPL 仅用本地小型 OPT/Qwen 验证；完整 checkpoint 精度/PPL、CUDA 数值和运行内存尚未验证。
 - explicit-mantissa 模型不包含 hidden-one、指数对齐及固定控制成本。1.0 的尾数是零，可能得到零“所选位成本”，但 FP8 乘法仍有实际工作；需要由硬件模型补充这些成本，不能据此声称无限物理加速。
 - W 稀疏度单独统计，不默认乘入 activation 稀疏加速比。权重位串行、零权重跳过、权重写入和存储压缩必须按目标架构另外建模。
 - 已启用 outlier sidepath 的计算不属于严格 FP8/INT4；统计器拒绝省略其成本的映射倍率采集。该数值 sidepath 和混精完整流程不在本次认证范围内。
+

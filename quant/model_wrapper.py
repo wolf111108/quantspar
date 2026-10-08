@@ -19,14 +19,8 @@ def wrap_model_by_family(
         )
 
     if family == "bitnet":
-        from .bitnet_wrapper import wrap_bitnet_model
-
-        return wrap_bitnet_model(
-            model,
-            quant_config,
-            mode=mode,
-            stat_manager=stat_manager,
-        )
+        # from .bitnet_wrapper import wrap_bitnet_model  # absent in this snapshot
+        raise ValueError("bitnet_wrapper is not included; use OPT or Qwen2/Qwen2.5")
 
     if family in {"qwen", "qwen2", "qwen2.5"}:
         return wrap_qwen_model(
@@ -37,13 +31,7 @@ def wrap_model_by_family(
         )
 
     if family in {"qwen3.5", "qwen3_5", "qwen3.5_moe", "qwen3_5_moe"}:
-        from .qwen35_wrapper import wrap_qwen35_model
-
-        return wrap_qwen35_model(
-            model,
-            quant_config,
-            mode=mode,
-            stat_manager=stat_manager,
-        )
+        # from .qwen35_wrapper import wrap_qwen35_model  # absent in this snapshot
+        raise ValueError("qwen35_wrapper is not included; use OPT or Qwen2/Qwen2.5")
 
     raise ValueError(f"Unsupported model_family: {family}")

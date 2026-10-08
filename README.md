@@ -20,6 +20,7 @@ python -m scripts.profile_asyn_cim --model-path /path/to/Qwen2.5-14B --output-di
 
 默认关闭混精。需要严格 IA FP8 / W INT4 时使用 `mixed_precision=False`、`outlier_ratio=0`。数值仿真使用浮点运算表达量化后的网格，不包含原生 INT4 kernel 或打包存储实现。
 
+- [OPT/Qwen 比特稀疏度入口、统一 FP 尾数口径与原生 FP16 配置](docs/bit_sparsity_pipeline.md)
 - [FP8/INT4 修复与使用说明](docs/fp8_int4_path.md)
 - [EBB-CIM / MulTCIM 统计与本地运行](docs/ebb_cim.md)
 - [Bitlet 论文参数、2048＋256 采集与时延估计](docs/bitlet.md)
@@ -64,3 +65,4 @@ Qwen 包装器与校准加载器已经上传。全模型依赖见 `requirements-
 ### Short online profiles / offline target-length estimates
 
 `python -m scripts.profile_bit_arches` now defaults to 256+32. Select collectors with `--architectures`; EBB is selected alone at 275 MHz in the new short config. Completed runs export per-layer/operator/phase cycle coefficients. `python -m scripts.estimate_profile_latency --profile-dir ... --output-dir ...` estimates target shapes without loading weights, keeps missing IO/E2E inputs null, and accepts target remaining costs from LLMCompass. See [short_profile_latency.md](docs/short_profile_latency.md) for assumptions and commands.
+

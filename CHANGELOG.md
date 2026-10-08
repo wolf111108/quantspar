@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-08 — Fix OPT/Qwen bit sparsity pipeline and native FP16
+
+- 目的：接通当前 OPT/Qwen 校准、量化、PPL 与 prefill/decode 的编码比特稀疏度采集，用统一的 FP 显式尾数口径统计激活、静态权重及动态 K/V，暂时默认关闭 unit。
+- 内容：注释缺失的 BitNet/Qwen3.5/MoE/others.evaluation 导入，主入口改用现有 Qwen 模式切换与根目录 perplexity；量化时绑定统计器，修复 shift 分母累加零位以及 reset 遗留，补全 global/phase/A/W/KV 计数；FP W/KV 与 A 共用 bit_scope。新增按 phase/layer/operand/format 的 JSON/CSV、加权汇总与保留 PPL/PD 两份快照的 TXT；主入口 collect_mapping=False、静态 W 每阶段一次并缓存计数；统计器/CLI 默认关闭 unit，PD 不再由旧 YAML 重新开启。FP16 改为原生网格舍入、scale=1、有限越界饱和；完整 FP16 模型强制以 half 加载，两个加载入口共用 dtype resolver；BF16 codes helper 显式舍入到 BF16。新增独立 OPT/Qwen FP16 YAML（OPT 上下文不超 2048）。默认 FP8/INT4 七类 Linear 的 outlier 置零、显式关闭混精、隔离 strict-v2 scale，移除未使用的层数元数据和复制 INT8 scale 建议。PPL forward 明确 use_cache=False；补充当前口径、范围、FP16 和默认 FP8/INT4 旁路问题的文档。
+- 验证：真实 PyTorch 2.6.0+cpu、Transformers 4.43.1 下全套 86 项 unittest 通过（77 项既有、9 项新增）；保存并加载本地两层 OPT/Qwen，六组模型/格式组合实际校准、PPL 与 prefill/decode 通过，数据 loader 仅替换为本地合成输入。独立原始编码参考覆盖 E4M3/E5M2/FP16/BF16 子正规数及所有操作数的尾数位数、INT4 补码、比例/reset、静态 W 去重与加权导出；验证校准不采集、quant_forward 采集、不调用 mapping/unit、FP16 舍入/输出/旧 scale 拒绝、FP16 模板和默认配置。两个入口 --help、compileall、diff 检查通过。
+- 限制与旧结果影响：没有运行完整 OPT/Qwen checkpoint、14B、CUDA、真实 FineWeb 或其他远端数据集；上述 PPL 仅为本地小模型的链路验证，不能作为实际模型精度结果。统计范围为包装的乘法输入，不含额外 output/bias/embedding/norm/LM head；K/V 是各次 attention 的操作数，历史 cache 会重复参与计数，默认 cache 仍为浮点存储。FP W/KV 从全存储位改为显式尾数（E4M3 8→3、FP16 16→10），global 新增 W/KV、比例分母及 FP16 数值语义改变，旧结果需重采集。默认关闭 outlier 改变数值和校准范围，旧 outlier/INT8/旧 FP16 scale 不应复用，需独立目录重新校准。架构 collector 的对齐、调度与周期公式没有修改，编码稀疏度不等同于完整运算成本或物理加速比；仍无原生 INT4 打包 kernel。
+
 
 ## 2026-10-08 — Add quantization pipeline entry and perplexity eval scripts
 
@@ -93,3 +100,4 @@
 - 内容：加入 mapping、quant_linear、quant_matmul、stat_manager 和单样本脚本共 5 个文件。
 - 验证：本次按 Git 内容补录；不代表初始通路已通过完整执行验证。
 - 限制：该快照缺少导入模块，且数值/统计/映射存在上述后续修复的问题。
+

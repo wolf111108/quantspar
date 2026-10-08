@@ -186,6 +186,7 @@ class FP8INT4Tests(unittest.TestCase):
     def test_channel_scale_calibration_manager_and_unit_counts(self):
         op=self.linear(granularity='output_channel');x=torch.randn(1,3,128)
         sm=QuantStatManager(self.tmp.name,nmacro=16)
+        sm.configure_unit_sparsity(enable=True)
         op(x,stat_collector=sm)
         scales=sm.stats['q_proj_0'].get_final_scales()
         self.assertEqual(list(scales['w_scale'].shape),[7])
@@ -240,3 +241,4 @@ class FP8INT4Tests(unittest.TestCase):
             op(x,stat_collector=QuantStatManager(self.tmp.name))
 
 if __name__=='__main__': unittest.main()
+

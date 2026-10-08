@@ -1,0 +1,73 @@
+model:
+  name: qwen2.5-14b
+  family: qwen2
+  dtype: fp16
+  attn_implementation: eager
+
+quantization:
+  enabled: true
+  mode: quant_forward
+  model_family: qwen2
+  quantize_linear: true
+  quantize_matmul: true
+  mixed_precision: false
+  # Native FP16 uses scale=1. Never reuse INT8 or legacy FP16 scales.
+  scale_dir: quant/scales/qwen2_14b_linear_matmul_fp16_native_v2/
+  calibration_policy:
+    default: recalibrate
+  q_proj: &linear_fp16
+    a_bit: fp16
+    w_bit: fp16
+    o_bit: fp16
+    d_bit: fp16
+    outlier_ratio: 0.0
+  k_proj: *linear_fp16
+  v_proj: *linear_fp16
+  o_proj: *linear_fp16
+  gate_proj: *linear_fp16
+  up_proj: *linear_fp16
+  down_proj: *linear_fp16
+  qk_matmul: &matmul_fp16
+    A_bit: fp16
+    B_bit: fp16
+    O_bit: fp16
+    d_bit: fp16
+    outlier_ratio: 0.0
+  pv_matmul: *matmul_fp16
+  lm_head:
+    enabled: false
+
+# A short forward initializes/saves the unit scales; no range fitting is needed.
+calibration:
+  dataset: HuggingFaceFW/fineweb
+  dataset_config: sample-10BT
+  split: train
+  streaming: true
+  text_column: text
+  min_text_tokens: 128
+  num_samples: 1
+  seq_length: 2048
+  batch_size: 1
+  seed: 23
+
+evaluation:
+  seq_length: 2048
+  max_eval_tokens: 32768
+  min_doc_tokens: 128
+  datasets:
+    - name: HuggingFaceFW/fineweb
+      config: sample-10BT
+      split: train
+      streaming: true
+      text_column: text
+
+prefill_decode_profile:
+  enabled: true
+  prefill_length: 2048
+  decode_steps: 64
+  num_samples: 1
+  max_eval_tokens: 2112
+  min_doc_tokens: 128
+
+unit_sparsity:
+  enabled: false

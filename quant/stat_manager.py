@@ -143,7 +143,7 @@ class QuantStatManager:
                  h: int = 64, w: int = 48, banks: int = 16,
                  bit_scope: str = "mantissa", cycles_per_effective_bit: float = 1,
                  ebb_config=None, bitlet_config=None, bitwave_config=None, slimllama_config=None,
-                 cache_static_weight_counts=False):
+                 cache_static_weight_counts=False, collect_mapping=True):
         """
         Initialize statistics manager.
 
@@ -162,6 +162,8 @@ class QuantStatManager:
             raise ValueError("cycles_per_effective_bit must be finite and positive")
         self.cim_geometry = dict(height=int(h),width=int(w),banks=int(banks),macros=self.nmacro)
         self.bit_scope = bit_scope
+        self.collect_mapping = bool(collect_mapping)
+        self.sparsity_records = {}
         self.cim_records = []
         self.cache_static_weight_counts = cache_static_weight_counts
         self._static_weight_counts = {}
@@ -346,7 +348,7 @@ class QuantStatManager:
         # enable_unit_sparsity:
         #   是否开启新的 unit 稀疏度统计
         # ------------------------------------------------------------
-        self.enable_unit_sparsity = True  #add
+        self.enable_unit_sparsity = False
         self.unit_bit_group_size = 2  #add
         self.unit_dim_group_size = 2  #add
 
@@ -421,6 +423,8 @@ class QuantStatManager:
             raise ValueError("Use a new architecture manager per run; reset would invalidate streamed trace")
         self.cim_records.clear();self._static_weights_seen.clear();self.per_layer_latency.clear()
         self._static_weight_counts.clear()
+        self.sparsity_records.clear()
+        self.shift_bit_total_count = self.shift_bit_0_count = 0
         for prefix in ('activation','weight','dynamic_weight'):
             for suffix in ('zero_count','element_count','bit_count','0bit_count','sparsebit_count',
                            'amplitude_zero_bits_total','amplitude_bit_count'):
@@ -494,7 +498,7 @@ class QuantStatManager:
 
         if elem > 0:  #add
             print(  #add
-                f"  量化激活零值比例: "  #add
+                f"  量化操作数零值比例: "
                 f"{counter['total_zero_count'] / elem:.4%}"  #add
             )  #add
             print(  #add
@@ -506,16 +510,11 @@ class QuantStatManager:
 
         if bits > 0:  #add
             print(  #add
-                f"  稀疏比特比例: "  #add
-                f"{counter['total_sparsebit_count'] / bits:.4%}"  #add
+                f"  零比特比例: "
+                f"{counter['total_0bit_count'] / bits:.4%}"
             )  #add
             print(  #add
-                f"  所选编码零比特比例: "  #add
-                f"{counter['total_amplitude_zero_bits_total'] / bits:.4%}"  #add
-            )  #add
-            print(  #add
-                f"  零比特比例: "  #add
-                f"{counter['total_0bit_count'] / bits:.4%}"  #add
+                f"  零比特数: {counter['total_0bit_count']:,} / {bits:,}"
             )  #add
         else:  #add
             print("  未收集到bit级统计")  #add
@@ -669,6 +668,10 @@ class QuantStatManager:
         self.total_sparsebit_count += sparse_bits_total
         self.total_amplitude_zero_bits_total += amplitude_zero_bits_total
         self.total_amplitude_bit_count += total_bits  #add
+        self._accumulate_phase_sparsity(
+            self.current_phase, total_num, abs_less_th, total_bits,
+            zero_bits_total, sparse_bits_total, amplitude_zero_bits_total,
+        )
 
     def collect_dynamic_weight_sparsity(
         self,
@@ -687,6 +690,8 @@ class QuantStatManager:
         self.dynamic_weight_sparsebit_count += sparse_bits_total
         self.dynamic_weight_amplitude_zero_bits_total += amplitude_zero_bits_total
         self.dynamic_weight_amplitude_bit_count += total_bits  #add
+        self.collect_global_sparsity(total_num, abs_less_th, total_bits,
+                                     zero_bits_total, sparse_bits_total, amplitude_zero_bits_total)
 
 
     def collect_weight_sparsity(
@@ -706,6 +711,8 @@ class QuantStatManager:
         self.weight_sparsebit_count += sparse_bits_total
         self.weight_amplitude_zero_bits_total += amplitude_zero_bits_total
         self.weight_amplitude_bit_count += total_bits  #add
+        self.collect_global_sparsity(total_num, abs_less_th, total_bits,
+                                     zero_bits_total, sparse_bits_total, amplitude_zero_bits_total)
 
 
     def collect_activation_sparsity(
@@ -720,10 +727,15 @@ class QuantStatManager:
         self.activation_zero_count += abs_less_th
         self.activation_element_count += total_num
         self.activation_bit_count += total_bits
-        self.shift_bit_total_count += zero_bits_total
-        self.shift_bit_0_count += sparse_bits_total
+        self.activation_0bit_count += zero_bits_total
+        self.activation_sparsebit_count += sparse_bits_total
+        # Historical shift_* names now alias ordinary zero-bit counts.
+        self.shift_bit_total_count += total_bits
+        self.shift_bit_0_count += zero_bits_total
         self.activation_amplitude_zero_bits_total += amplitude_zero_bits_total
         self.activation_amplitude_bit_count += total_bits  #add
+        self.collect_global_sparsity(total_num, abs_less_th, total_bits,
+                                     zero_bits_total, sparse_bits_total, amplitude_zero_bits_total)
 
     def collect_matmul_stats(
         self,
@@ -2346,15 +2358,25 @@ class QuantStatManager:
         sparse=sparse_counts(activation,spec,self.bit_scope,chunk_size=self.sparse_stat_chunk_size)
         self.collect_activation_sparsity(*sparse)
         self.collect_unit_sparsity(layer_name,layer_idx,activation,spec)
-        key=(self.current_phase,layer_name,layer_idx,weight_spec.name())
+        operand_a = "Q" if layer_name.startswith("qk_matmul") else (
+            "attention_probs" if layer_name.startswith("pv_matmul") else "activation")
+        operand_b = "K" if layer_name.startswith("qk_matmul") else (
+            "V" if layer_name.startswith("pv_matmul") else "weight")
+        self._record_operand_sparsity(layer_name, layer_idx, operand_a, spec, sparse)
+        key=(self.current_phase,layer_name,layer_idx,weight_spec.name(),self.bit_scope)
         wt = self._static_weight_counts.get(key) if self.cache_static_weight_counts and not attention else None
         if wt is None:
-            wt=sparse_counts(weight,weight_spec,"storage",chunk_size=self.sparse_stat_chunk_size)
+            wt=sparse_counts(weight,weight_spec,self.bit_scope,chunk_size=self.sparse_stat_chunk_size)
             if self.cache_static_weight_counts and not attention:
                 self._static_weight_counts[key] = wt
-        if attention: self.collect_dynamic_weight_sparsity(*wt)
+        if attention:
+            self.collect_dynamic_weight_sparsity(*wt)
+            self._record_operand_sparsity(layer_name, layer_idx, operand_b, weight_spec, wt)
         elif key not in self._static_weights_seen:
             self.collect_weight_sparsity(*wt);self._static_weights_seen.add(key)
+            self._record_operand_sparsity(layer_name, layer_idx, operand_b, weight_spec, wt)
+        if not self.collect_mapping:
+            return
         cim=CIM_sys(h=self.cim_geometry["height"],w=self.cim_geometry["width"],
                     Nadder=self.cim_geometry["banks"],Nmacro=self.nmacro,freq=int(self.clock_freq_hz))
         mapped_activation=activation if attention else activation.reshape(-1,in_features)
@@ -2371,6 +2393,80 @@ class QuantStatManager:
         result["dense_compute_seconds"]=self._cycles_to_seconds(result["dense_steps"])
         self.cim_records.append(result)
         self._accumulate_cim_record(result)
+
+    def _record_operand_sparsity(self, layer_name, layer_idx, operand, spec, counts):
+        """Aggregate actual encoded bits, with separate A/W/K/V records."""
+        key = (self.current_phase, layer_name, layer_idx, operand, spec.name())
+        row = self.sparsity_records.setdefault(key, dict(
+            phase=self.current_phase, layer_name=layer_name, layer_idx=layer_idx,
+            operand=operand, format=spec.name(),
+            bit_scope="twos_complement" if spec.kind == "int" else self.bit_scope,
+            counted_width=counts[2] // counts[0] if counts[0] else 0,
+            observations=0, elements=0, zero_elements=0, bits=0, zero_bits=0,
+        ))
+        row["observations"] += 1
+        for name, value in zip(("elements", "zero_elements", "bits", "zero_bits"), counts[:4]):
+            row[name] += value
+
+    @staticmethod
+    def _sparsity_ratios(row):
+        result = dict(row)
+        result["element_zero_ratio"] = row["zero_elements"] / row["elements"] if row["elements"] else None
+        result["bit_zero_ratio"] = row["zero_bits"] / row["bits"] if row["bits"] else None
+        return result
+
+    def get_sparsity_summary(self, phases=None):
+        """Ratios are sums of zero bits divided by sums of counted bits."""
+        selected = set(phases) if phases is not None else None
+        rows = [self._sparsity_ratios(row) for key, row in sorted(self.sparsity_records.items())
+                if selected is None or key[0] in selected]
+        totals = dict(elements=0, zero_elements=0, bits=0, zero_bits=0)
+        by_phase_operand = {}
+        for row in rows:
+            name = (row["phase"], row["operand"])
+            entry = by_phase_operand.setdefault(name, dict(
+                phase=row["phase"], operand=row["operand"],
+                elements=0, zero_elements=0, bits=0, zero_bits=0,
+            ))
+            for field in ("elements", "zero_elements", "bits", "zero_bits"):
+                totals[field] += row[field]
+                entry[field] += row[field]
+        return dict(
+            schema_version=1, bit_scope=self.bit_scope,
+            aggregation="sum_zero_bits / sum_counted_bits",
+            static_weight_counting="once per layer and phase",
+            dynamic_operand_counting="each quantized forward; existing decode GQA packing applies",
+            total=self._sparsity_ratios(totals), records=rows,
+            phase_operands=[self._sparsity_ratios(value) for _, value in sorted(by_phase_operand.items())],
+        )
+
+    def export_sparsity_stats(self, json_path, csv_path=None, phases=None):
+        import csv
+        import json
+        from pathlib import Path
+        doc = self.get_sparsity_summary(phases)
+        destination = Path(json_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(doc, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        if csv_path is not None:
+            fields = ("phase", "layer_name", "layer_idx", "operand", "format", "bit_scope",
+                      "counted_width", "observations", "elements", "zero_elements", "bits",
+                      "zero_bits", "element_zero_ratio", "bit_zero_ratio")
+            destination = Path(csv_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(doc["records"])
+        return doc
+
+    def print_operand_sparsity(self, phases=None):
+        print("\nBIT SPARSITY BY PHASE AND OPERAND")
+        for row in self.get_sparsity_summary(phases)["phase_operands"]:
+            ratio = row["bit_zero_ratio"]
+            value = f"{ratio:.4%}" if ratio is not None else "unavailable"
+            print(f"  {row['phase']} / {row['operand']}: "
+                  f"{row['zero_bits']:,} / {row['bits']:,} = {value}")
 
     def _accumulate_cim_record(self,result):
         sparse=result["sparse_compute_seconds"];dense=result["dense_compute_seconds"]
@@ -2912,3 +3008,4 @@ class QuantStatManager:
         for hook in self.hooks:
             hook.remove()
         self.hooks.clear()
+

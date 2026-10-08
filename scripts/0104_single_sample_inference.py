@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quant import load_config, QuantStatManager
 from quant.quant_linear import QuantizedLinear
 from quant.quant_matmul import QuantizedMatMul
+from quant.quant_spec import resolve_model_dtype
 
 def _load_full_model_dependencies():
     """Load optional full-model dependencies after argument parsing."""
@@ -131,7 +132,7 @@ def print_header(title):
 
 def build_wrapped_model(args, config, scale_dir, mode="scale_inspection"):
     model_kwargs = dict(
-        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+        torch_dtype=resolve_model_dtype(config, args.device),
         device_map="auto",
         trust_remote_code=True,
     )
@@ -825,3 +826,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

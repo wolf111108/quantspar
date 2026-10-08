@@ -18,13 +18,16 @@ import time
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from quant import load_config, QuantStatManager
 from quant.model_wrapper import wrap_model_by_family
-from quant.bitnet_wrapper import switch_quantization_mode_all
+# from quant.bitnet_wrapper import switch_quantization_mode_all  # absent in this snapshot
+from quant.qwen_wrapper import switch_quantization_mode_all
+from quant.quant_spec import resolve_model_dtype
 from others.data import CalibrationDataLoader
-from others.evaluation import evaluate_perplexity, profile_prefill_decode_sparsity  #add
+# from others.evaluation import evaluate_perplexity, profile_prefill_decode_sparsity  # absent
+from perplexity import evaluate_perplexity, profile_prefill_decode_sparsity
 from tqdm import tqdm
 from quant.quant_linear import QuantizedLinear
 from quant.quant_matmul import QuantizedMatMul
@@ -84,7 +87,7 @@ def parse_args():
         "--stats-output-dir",  #add
         type=str,  #add
         default=None,  #add
-        help="Directory to save detailed sparsity CSV files",  #add
+        help="Directory to save encoded bit sparsity JSON/CSV and layer coverage",  #add
     )  #add
 
     parser.add_argument(  #add
@@ -104,7 +107,7 @@ def parse_args():
         "--model-path",
         type=str,
         required=True,
-        help="Path to pretrained OPT model"
+        help="Path to pretrained OPT or Qwen2/Qwen2.5 model"
     )
     parser.add_argument(
         "--device",
@@ -134,10 +137,9 @@ def parse_args():
     parser.add_argument(  #add
         "--unit-sparsity",  #add
         action=argparse.BooleanOptionalAction,  #add
-        default=True,  #add
+        default=False,
         help=(  #add
-            "Enable/disable unit sparsity collection "  #add
-            "(use --no-unit-sparsity to disable)"  #add
+            "Unit sparsity is disabled by default; --unit-sparsity explicitly enables it."
         ),  #add
     )  #add
     parser.add_argument(  #add
@@ -171,6 +173,8 @@ def build_wrapped_model(args, config, scale_dir, mode="scale_inspection"):
     # 本地模型目录缺少 modeling_bitnet.py / configuration_bitnet.py，
     # trust_remote_code=True 反而会尝试走 auto_map 路径而报错。
     model_family = config["quantization"].get("model_family", "opt").lower()
+    if model_family not in {"opt", "qwen", "qwen2", "qwen2.5"}:
+        raise ValueError("This snapshot supports OPT and Qwen2/Qwen2.5 only")
     if mode is None:
         mode = (
             "scale_inspection"
@@ -227,6 +231,9 @@ def build_wrapped_model(args, config, scale_dir, mode="scale_inspection"):
     else:
         _AutoModelClass = AutoModelForCausalLM
 
+    model_kwargs["torch_dtype"] = resolve_model_dtype(config, args.device)
+    if args.device == "cpu":
+        model_kwargs["device_map"] = None
     model = _AutoModelClass.from_pretrained(
         args.model_path,
         **model_kwargs,
@@ -340,12 +347,22 @@ def calibrate(args, config):
 
     return model
 
-def _export_txt_summary(args, config, stat_manager, results):  #add
+def _export_bit_sparsity(args, stat_manager, suffix, phases):
+    run_name = args.run_name or os.path.splitext(os.path.basename(args.config))[0]
+    output_dir = args.stats_output_dir or args.results_dir
+    json_path = os.path.join(output_dir, f"{run_name}_{suffix}_bit_sparsity.json")
+    csv_path = os.path.join(output_dir, f"{run_name}_{suffix}_bit_sparsity.csv")
+    doc = stat_manager.export_sparsity_stats(json_path, csv_path, phases)
+    print(f"Bit sparsity saved to: {json_path} and {csv_path}")
+    return doc
+
+
+def _export_txt_summary(args, config, stat_manager, results, sparsity_summaries=None):  #add
     """把本次 run 的关键结果汇总导出为 .txt 报告。  #add
 
     输出路径：--results-dir/<run_name>_<时间戳>.txt
     内容：run 元信息、命令行开关状态、PPL 结果、
-    unit sparsity（phase × layer_type 聚合）、collected layers 摘要。
+    encoded bit sparsity、可选 unit sparsity、collected layers 摘要。
     """  #add
     import datetime  #add
 
@@ -378,6 +395,16 @@ def _export_txt_summary(args, config, stat_manager, results):  #add
     lines.append(f"FP baseline   : {args.fp_baseline}")  #add
     lines.append(f"Unit sparsity : {args.unit_sparsity}")  #add
     lines.append("")  #add
+
+    lines.append("BIT SPARSITY (all FP operands: explicit mantissa only)")
+    for flow, summary in (sparsity_summaries or {}).items():
+        lines.append(f"{flow}: sum zero bits / sum counted bits")
+        for row in summary["phase_operands"]:
+            ratio = row["bit_zero_ratio"]
+            value = f"{ratio:.4%}" if ratio is not None else "unavailable"
+            lines.append(f"  {row['phase']} / {row['operand']}: "
+                         f"{row['zero_bits']} / {row['bits']} = {value}")
+    lines.append("")
 
     lines.append("-" * 80)  #add
     lines.append("PERPLEXITY")  #add
@@ -461,13 +488,15 @@ def _export_txt_summary(args, config, stat_manager, results):  #add
 def evaluate(args, config, model):
     print_header("STEP 2: QUANTIZATION & EVALUATION")
 
-    stat_manager = QuantStatManager(config["quantization"]["scale_dir"])
+    stat_manager = QuantStatManager(config["quantization"]["scale_dir"],
+                                   bit_scope="mantissa", collect_mapping=False,
+                                   cache_static_weight_counts=True)
 
 
-    from quant.quant_moe_experts import QuantizedMoEExperts  #add
+    # from quant.quant_moe_experts import QuantizedMoEExperts  # absent in this snapshot
 
     for module in model.modules():  #add
-        if isinstance(module, (QuantizedLinear, QuantizedMatMul, QuantizedMoEExperts)):  #add
+        if isinstance(module, (QuantizedLinear, QuantizedMatMul)):
             module._stat_manager = stat_manager  #add
 
         # Qwen attention wrapper stores stat_manager on attention_module.  #add
@@ -562,6 +591,7 @@ def evaluate(args, config, model):
     print(f"Evaluation flow: {args.eval_flow}")  #add
     
     results = {}  #add
+    sparsity_summaries = {}
 
     if run_ppl:  #add
         print("\n" + "-" * 80)  #add
@@ -679,17 +709,10 @@ def evaluate(args, config, model):
 
         model.config.use_cache = False
 
-        if stat_manager.shift_bit_total_count > 0:  #add
-            print(
-                f"shift 0 ratio: "
-                f"{stat_manager.shift_bit_0_count / stat_manager.shift_bit_total_count:.4%}"
-            )
-            print(
-                f"0 ratio: "
-                f"{stat_manager.activation_amplitude_zero_bits_total / stat_manager.activation_bit_count:.4%}"
-            )
-        else:  #add
-            print("PPL 阶段没有收集到 bit 级统计。")  #add
+        stat_manager.print_global_sparsity("PPL FULL-FORWARD OPERAND SPARSITY")
+        stat_manager.print_operand_sparsity(["full_forward"])
+        sparsity_summaries["ppl"] = _export_bit_sparsity(
+            args, stat_manager, "full_forward", ["full_forward"])
 
         stat_manager.print_collected_layer_names(  #add
             phase="full_forward",  #add
@@ -756,11 +779,10 @@ def evaluate(args, config, model):
         stat_manager.reset_sparsity()  #add
 
         # ------------------------------------------------------------
-        # Re-enable unit/block sparsity for prefill/decode profiling  #add
+        # Preserve the explicit CLI choice; old YAML cannot re-enable units.
         # ------------------------------------------------------------
-        unit_cfg = config.get("unit_sparsity", {})  #add
         stat_manager.configure_unit_sparsity(  #add
-            enable=unit_cfg.get("enabled", True),  #add
+            enable=args.unit_sparsity,
             bit_group_size=unit_bit_group_size,  #add
             dim_group_size=unit_dim_group_size,  #add
         )  #add
@@ -822,7 +844,11 @@ def evaluate(args, config, model):
 
         stat_manager.print_prefill_decode_sparsity()  #add
         stat_manager.print_global_sparsity("PREFILL + DECODE TOTAL SPARSITY")  #add
-        stat_manager.print_unit_sparsity_by_phase()  #add
+        stat_manager.print_operand_sparsity(["prefill", "decode"])
+        sparsity_summaries["prefill_decode"] = _export_bit_sparsity(
+            args, stat_manager, "prefill_decode", ["prefill", "decode"])
+        if args.unit_sparsity:
+            stat_manager.print_unit_sparsity_by_phase()
 
         # ------------------------------------------------------------
         # Export prefill/decode collected layers after profiling  #add
@@ -954,7 +980,7 @@ def evaluate(args, config, model):
     print("\n" + "=" * 80)
 
     # 导出 .txt 汇总报告（--results-dir，默认根目录 results/）  #add
-    _export_txt_summary(args, config, stat_manager, results)  #add
+    _export_txt_summary(args, config, stat_manager, results, sparsity_summaries)
 
     del model
     torch.cuda.empty_cache()
@@ -997,3 +1023,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
