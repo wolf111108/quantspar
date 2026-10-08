@@ -2323,7 +2323,11 @@ class QuantStatManager:
 
     def collect_quant_activation(self,layer_name,layer_idx,activation,FP_activation,
                                  weight,weight_spec,spec,digit_size,parallelism,
-                                 in_features,out_features):
+                                 in_features,out_features,*,outlier_masked=False):
+        if outlier_masked and (self.collect_mapping or self.ebb_stats is not None
+                               or self.bit_architecture_collectors):
+            raise ValueError("Outlier sidepath sparsity requires collect_mapping=False "
+                             "and no architecture backend; sidepath compute costs are not modeled")
         if activation is None or spec is None or spec.kind == "none": return
         if self.bit_architecture_collectors:
             context = dict(self.execution_context)
@@ -2362,19 +2366,29 @@ class QuantStatManager:
             "attention_probs" if layer_name.startswith("pv_matmul") else "activation")
         operand_b = "K" if layer_name.startswith("qk_matmul") else (
             "V" if layer_name.startswith("pv_matmul") else "weight")
-        self._record_operand_sparsity(layer_name, layer_idx, operand_a, spec, sparse)
+        self._record_operand_sparsity(layer_name, layer_idx, operand_a, spec, sparse,
+                                      outlier_masked, "each_quantized_forward")
+        # Linear's outlier W mask depends on this call's activation channels.
+        # It is neither invariant nor eligible for once-per-phase caching.
+        static_weight = not attention and not outlier_masked
         key=(self.current_phase,layer_name,layer_idx,weight_spec.name(),self.bit_scope)
-        wt = self._static_weight_counts.get(key) if self.cache_static_weight_counts and not attention else None
+        wt = self._static_weight_counts.get(key) if self.cache_static_weight_counts and static_weight else None
         if wt is None:
             wt=sparse_counts(weight,weight_spec,self.bit_scope,chunk_size=self.sparse_stat_chunk_size)
-            if self.cache_static_weight_counts and not attention:
+            if self.cache_static_weight_counts and static_weight:
                 self._static_weight_counts[key] = wt
         if attention:
             self.collect_dynamic_weight_sparsity(*wt)
-            self._record_operand_sparsity(layer_name, layer_idx, operand_b, weight_spec, wt)
+            self._record_operand_sparsity(layer_name, layer_idx, operand_b, weight_spec, wt,
+                                          outlier_masked, "each_quantized_forward")
+        elif not static_weight:
+            self.collect_weight_sparsity(*wt)
+            self._record_operand_sparsity(layer_name, layer_idx, operand_b, weight_spec, wt,
+                                          outlier_masked, "each_quantized_forward")
         elif key not in self._static_weights_seen:
             self.collect_weight_sparsity(*wt);self._static_weights_seen.add(key)
-            self._record_operand_sparsity(layer_name, layer_idx, operand_b, weight_spec, wt)
+            self._record_operand_sparsity(layer_name, layer_idx, operand_b, weight_spec, wt,
+                                          outlier_masked, "once_per_layer_and_phase")
         if not self.collect_mapping:
             return
         cim=CIM_sys(h=self.cim_geometry["height"],w=self.cim_geometry["width"],
@@ -2394,12 +2408,14 @@ class QuantStatManager:
         self.cim_records.append(result)
         self._accumulate_cim_record(result)
 
-    def _record_operand_sparsity(self, layer_name, layer_idx, operand, spec, counts):
+    def _record_operand_sparsity(self, layer_name, layer_idx, operand, spec, counts,
+                                 outlier_masked, counting):
         """Aggregate actual encoded bits, with separate A/W/K/V records."""
-        key = (self.current_phase, layer_name, layer_idx, operand, spec.name())
+        key = (self.current_phase, layer_name, layer_idx, operand, spec.name(), outlier_masked)
         row = self.sparsity_records.setdefault(key, dict(
             phase=self.current_phase, layer_name=layer_name, layer_idx=layer_idx,
             operand=operand, format=spec.name(),
+            outlier_masked=bool(outlier_masked), counting=counting,
             bit_scope="twos_complement" if spec.kind == "int" else self.bit_scope,
             counted_width=counts[2] // counts[0] if counts[0] else 0,
             observations=0, elements=0, zero_elements=0, bits=0, zero_bits=0,
@@ -2423,19 +2439,26 @@ class QuantStatManager:
         totals = dict(elements=0, zero_elements=0, bits=0, zero_bits=0)
         by_phase_operand = {}
         for row in rows:
-            name = (row["phase"], row["operand"])
+            name = (row["phase"], row["operand"], row["outlier_masked"])
             entry = by_phase_operand.setdefault(name, dict(
                 phase=row["phase"], operand=row["operand"],
+                outlier_masked=row["outlier_masked"],
                 elements=0, zero_elements=0, bits=0, zero_bits=0,
             ))
             for field in ("elements", "zero_elements", "bits", "zero_bits"):
                 totals[field] += row[field]
                 entry[field] += row[field]
         return dict(
-            schema_version=1, bit_scope=self.bit_scope,
+            schema_version=2, bit_scope=self.bit_scope,
             aggregation="sum_zero_bits / sum_counted_bits",
-            static_weight_counting="once per layer and phase",
+            static_weight_counting="once per layer and phase; outlier-masked weights counted each forward",
             dynamic_operand_counting="each quantized forward; existing decode GQA packing applies",
+            outlier_sparsity=dict(
+                present=any(row["outlier_masked"] for row in rows),
+                counted_branch="quantized normal operands at full shape",
+                mask_generated_zeros="included",
+                high_precision_sidepath_counted=False,
+            ),
             total=self._sparsity_ratios(totals), records=rows,
             phase_operands=[self._sparsity_ratios(value) for _, value in sorted(by_phase_operand.items())],
         )
@@ -2450,7 +2473,7 @@ class QuantStatManager:
         destination.write_text(json.dumps(doc, indent=2, allow_nan=False) + "\n", encoding="utf-8")
         if csv_path is not None:
             fields = ("phase", "layer_name", "layer_idx", "operand", "format", "bit_scope",
-                      "counted_width", "observations", "elements", "zero_elements", "bits",
+                      "outlier_masked", "counting", "counted_width", "observations", "elements", "zero_elements", "bits",
                       "zero_bits", "element_zero_ratio", "bit_zero_ratio")
             destination = Path(csv_path)
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2465,7 +2488,8 @@ class QuantStatManager:
         for row in self.get_sparsity_summary(phases)["phase_operands"]:
             ratio = row["bit_zero_ratio"]
             value = f"{ratio:.4%}" if ratio is not None else "unavailable"
-            print(f"  {row['phase']} / {row['operand']}: "
+            scope = " (outlier mask zeros included)" if row["outlier_masked"] else ""
+            print(f"  {row['phase']} / {row['operand']}{scope}: "
                   f"{row['zero_bits']:,} / {row['bits']:,} = {value}")
 
     def _accumulate_cim_record(self,result):

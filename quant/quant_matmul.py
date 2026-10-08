@@ -311,50 +311,12 @@ class QuantizedMatMul(nn.Module):
                 A, B, stat_collector
             )
         if self.outlier_ratio > 0.0:
-            outliermore = True
-            channel_mask = self.get_outlier_mask_channel(A, self.outlier_ratio)
-
-            # A: feature dim is always dim=-1
-            A_channel_mask = channel_mask.view(*([1] * (A.dim() - 1)), -1)
-            # B: feature dim may be -1 (pv_matmul) or -2 (qk_matmul after transpose)
-            if B.shape[-1] == channel_mask.numel():
-                B_channel_mask = channel_mask.view(*([1] * (B.dim() - 1)), -1)
-            elif B.dim() >= 2 and B.shape[-2] == channel_mask.numel():
-                B_channel_mask = channel_mask.view(*([1] * (B.dim() - 2)), -1, 1)
-            else:
-                B_channel_mask = torch.zeros(1, dtype=torch.bool, device=A.device)
-            del channel_mask
-            if outliermore:
-                B_outlier_mask = self._get_outlier_mask_1d(B, self.outlier_ratio)
-                B_channel_mask = B_channel_mask | B_outlier_mask
-                del B_outlier_mask
-            else:
-                pass
-            A_normal_fp = A * (~A_channel_mask).to(dtype=A.dtype)
-            A_normal_fp = A_normal_fp.to(torch.float32)
-
-            B_normal_fp = B * (~B_channel_mask).to(dtype=B.dtype)
-            B_normal_fp = B_normal_fp.to(torch.float32)
-
-            del B_channel_mask
-            del A_channel_mask
-
-            self.A_interval = safe_scale_from_tensor(A_normal_fp, self.A_spec)
-            if self.A_interval == 0:
-                self.A_interval = None
-
-            self.B_interval = safe_scale_from_tensor(B_normal_fp, self.B_spec)
-            
-            del A_normal_fp
-            del B_normal_fp
-
-            channel_mask = self.get_outlier_mask_channel(out, self.outlier_ratio)
-
-            normal_idx = torch.nonzero(~channel_mask, as_tuple=False).flatten()
-    
-            O_normal_fp = out.index_select(dim=-1, index=normal_idx).to(torch.float32)
-
-            self.O_interval = safe_scale_from_tensor(O_normal_fp, self.O_spec)
+            A_normal, B_normal, _, _ = self._split_outlier_operands(A, B)
+            self.A_interval = safe_scale_from_tensor(A_normal, self.A_spec)
+            self.B_interval = safe_scale_from_tensor(B_normal, self.B_spec)
+            channels = self.get_outlier_mask_channel(out, self.outlier_ratio)
+            out_mask = channels.view(*([1] * (out.ndim - 1)), -1)
+            self.O_interval = safe_scale_from_tensor(out.masked_fill(out_mask, 0), self.O_spec)
         else:
             self.A_interval = safe_scale_from_tensor(A, self.A_spec)
             self.B_interval = safe_scale_from_tensor(B, self.B_spec)
@@ -466,8 +428,6 @@ class QuantizedMatMul(nn.Module):
             )
 
         if self.outlier_ratio > 0.0:
-            if stat_collector is not None:
-                raise ValueError("Mapped speedup does not include the outlier sidepath; use outlier_ratio=0")
             return self._quant_forward_with_outlier(A, B, stat_collector)
         A_code = quant_awo(A,self.A_interval,self.A_spec,out_dtype=torch.float32)
         B_code = quant_awo(B,self.B_interval,self.B_spec,out_dtype=torch.float32)
@@ -483,300 +443,46 @@ class QuantizedMatMul(nn.Module):
         return out_real.to(A.dtype)
 
 
+    def _split_outlier_operands(self, A, B):
+        """Protect paired reduction channels, including square QK/PV operands."""
+        if A.ndim < 2 or B.ndim < 2 or A.shape[-1] != B.shape[-2]:
+            raise ValueError("Outlier MatMul requires A[..., M, K] and B[..., K, N]")
+        channels = self.get_outlier_mask_channel(A, self.outlier_ratio)
+        A_mask = channels.view(*([1] * (A.ndim - 1)), -1)
+        B_mask = channels.view(*([1] * (B.ndim - 2)), -1, 1)
+        B_mask = B_mask | self._get_outlier_mask_1d(B, self.outlier_ratio)
+        A_float, B_float = A.float(), B.float()
+        return (A_float.masked_fill(A_mask, 0),
+                B_float.masked_fill(B_mask, 0),
+                A_float.masked_fill(~A_mask, 0),
+                B_float.masked_fill(~B_mask, 0))
+
     def _quant_forward_with_outlier(self, A, B, stat_collector=None):
-        # """带 outlier 保护的量化前向计算。"""
-
-        # A_outlier_mask = self._get_outlier_mask_1d(A, self.outlier_ratio)
-        # B_outlier_mask = self._get_outlier_mask_1d(B, self.outlier_ratio)
-        # A_normal_mask = ~A_outlier_mask
-        # B_normal_mask = ~B_outlier_mask
-
-        # # === 分离 outlier 和 normal 部分（FP16）===
-        # A_fp = A * A_outlier_mask.to(torch.float32)        # A 的 outlier，保留 FP16
-        # A_normal_fp = A * A_normal_mask.to(torch.float32)  # A 的 normal，FP16（待量化）
-        # B_fp = B * B_outlier_mask.to(torch.float32)        # B 的 outlier，保留 FP16
-        # B_normal_fp = B * B_normal_mask.to(torch.float32)  # B 的 normal，FP16（待量化）
-        # del A_outlier_mask
-        # del B_outlier_mask
-        # del A_normal_mask
-        # del B_normal_mask
-
-
-        # # === 量化 normal 部分 ===
-        # M_qa_qb = torch.tensor(self.A_interval * self.B_interval)
-        # M_qa_qb = self.round(M_qa_qb * MATMUL_SHIFT_NUM)
-
-        # M_fa_fb = torch.tensor(1)
-        # M_fa_fb = self.round(M_fa_fb * 1)
-
-        # M_fa_qb = torch.tensor(self.B_interval)
-        # M_fa_qb = self.round(M_fa_qb * 2**16)
-
-        # M_qa_fb = torch.tensor(self.A_interval)
-        # M_qa_fb = self.round(M_qa_fb * 2**16)
-
-        # M_1fq   = torch.tensor(self.O_interval)
-        # M_1fq   = self.round(M_1fq * 2**16)
-
-        # A_sim = quant_awo(
-        #     A_normal_fp,
-        #     self.A_interval,
-        #     self.A_spec,
-        #     out_dtype=A.dtype,
-        #     chunk_size=1_048_576,
-        # )
-        # del A_normal_fp
-        # B_sim = quant_awo(
-        #     B_normal_fp,
-        #     self.B_interval,
-        #     self.B_spec,
-        #     out_dtype=B.dtype,
-        #     chunk_size=1_048_576,
-        # )
-        # del B_normal_fp
-        # """
-        # A_sim_fp32 = A_sim.to(torch.float32)
-        # B_sim_fp32 = B_sim.to(torch.float32)
-    
-        # out_qa_qb = self._matmul(A_sim_fp32, B_sim_fp32)
-        # out_qa_qb = out_qa_qb.mul_(M_qa_qb)
-        # out_qa_qb = torch.div(out_qa_qb, MATMUL_SHIFT_NUM)
-
-        # out_fa_fb = self._matmul(A_fp, B_fp)
-        # out_fa_fb = out_fa_fb.mul_(M_fa_fb)
-        # out_fa_fb = torch.div(out_fa_fb, 1) + out_qa_qb
-    
-        # out_fa_qb = self._matmul(A_fp, B_sim_fp32)
-        # out_fa_qb = out_fa_qb.mul_(M_fa_qb)
-        # out_fa_qb = torch.div(out_fa_qb, 2**16) + out_fa_fb
-
-        # out_qa_fb = self._matmul(A_sim_fp32, B_fp)
-        # out_qa_fb = out_qa_fb.mul_(M_qa_fb)
-        # out_qa_fb = torch.div(out_qa_fb, 2**16) + out_fa_qb
-
-
-        # out_with_outlier = out_qa_fb
-        # """
-        # A_sim_fp32 = A_sim.to(torch.float32)
-        # B_sim_fp32 = B_sim.to(torch.float32)
-        # del A_sim
-        # del B_sim
-        # out_with_outlier = self._matmul(A_sim_fp32, B_sim_fp32)
-        # out_with_outlier.mul_(M_qa_qb)
-        # out_with_outlier.div_(MATMUL_SHIFT_NUM)
-
-        # tmp = self._matmul(A_fp, B_fp)
-        # tmp.mul_(M_fa_fb)
-        # out_with_outlier.add_(tmp)
-        # del tmp
-
-        # tmp = self._matmul(A_fp, B_sim_fp32)
-        # tmp.mul_(M_fa_qb)
-        # tmp.div_(2**16)
-        # out_with_outlier.add_(tmp)
-        # del tmp
-        # del B_sim_fp32
-        # del A_fp
-
-        # tmp = self._matmul(A_sim_fp32, B_fp)
-        # tmp.mul_(M_qa_fb)
-        # tmp.div_(2**16)
-        # out_with_outlier.add_(tmp)
-        # del tmp
-        # del A_sim_fp32
-        # del B_fp
-        # """
-        # out_with_outlier_mask = self._get_outlier_mask_1d(out_with_outlier, self.outlier_ratio)
-        # out_without_outlier_mask = ~out_with_outlier_mask
-
-        # out_outlier = out_with_outlier * out_with_outlier_mask.to(torch.float32)        # outlier，保留 FP16
-        # out_normal = out_with_outlier * out_without_outlier_mask.to(torch.float32)  # normal，FP16（待量化）
-
-        # out_normal_quant = quant_awo(
-        #     out_normal,
-        #     self.O_interval,
-        #     self.O_spec,
-        #     out_dtype=out_normal.dtype,
-        # )
-
-        # out_normal_dequant = out_normal_quant.to(torch.float32).mul_(M_1fq).to(A.dtype)
-        # out_normal_dequant = torch.div(out_normal_dequant, 2**16)
-        # out_outlier = out_outlier.to(A.dtype)
-
-        # out = out_normal_dequant + out_outlier
-        # """
-        # out_with_outlier_mask = self._get_outlier_mask_1d(
-        #     out_with_outlier,
-        #     self.outlier_ratio,
-        # )
-
-        # # normal 部分：outlier 位置置 0
-        # out_normal = out_with_outlier.masked_fill(out_with_outlier_mask, 0)
-
-        # out_normal_quant = quant_awo(
-        #     out_normal,
-        #     self.O_interval,
-        #     self.O_spec,
-        #     out_dtype=out_normal.dtype,
-        #     chunk_size=1_048_576,
-        # )
-
-        # del out_normal
-
-        # out = out_normal_quant.to(torch.float32)
-        # del out_normal_quant
-
-        # out.mul_(M_1fq)
-        # out.div_(2**16)
-        # out = out.to(A.dtype)
-
-        # out = torch.where(
-        #     out_with_outlier_mask,
-        #     out_with_outlier.to(A.dtype),
-        #     out,
-        # )
-
-        # del out_with_outlier_mask
-
-        # if torch.isnan(out).max():
-        #     pass
-
-        # return out
-        """带 outlier 保护的量化前向计算。"""
-        outliermore = True
-        channel_mask = self.get_outlier_mask_channel(A, self.outlier_ratio)
-
-        # A: feature dim is always dim=-1
-        A_channel_mask = channel_mask.view(*([1] * (A.dim() - 1)), -1)
-        # B: feature dim may be -1 (pv_matmul) or -2 (qk_matmul after transpose)
-        if B.shape[-1] == channel_mask.numel():
-            B_channel_mask = channel_mask.view(*([1] * (B.dim() - 1)), -1)
-        elif B.dim() >= 2 and B.shape[-2] == channel_mask.numel():
-            B_channel_mask = channel_mask.view(*([1] * (B.dim() - 2)), -1, 1)
-        else:
-            B_channel_mask = torch.zeros(1, dtype=torch.bool, device=A.device)
-        del channel_mask
-        if outliermore:
-            B_outlier_mask = self._get_outlier_mask_1d(B, self.outlier_ratio)
-            B_channel_mask = B_channel_mask | B_outlier_mask
-            del B_outlier_mask
-        else:
-            pass
-
-        A_fp = A * A_channel_mask.to(torch.float32)        # x 的 outlier，保留 FP16
-        A_normal_fp = A * (~A_channel_mask).to(dtype=A.dtype)
-        A_normal_fp = A_normal_fp.to(torch.float32)
-
-        B_fp = B * B_channel_mask.to(torch.float32)        # w 的 outlier，保留 FP16
-        B_normal_fp = B * (~B_channel_mask).to(dtype=B.dtype)
-        B_normal_fp = B_normal_fp.to(torch.float32)
-
-        del B_channel_mask
-        del A_channel_mask
-
-        M_q   = torch.tensor(self.O_interval)
-        M_q   = self.round(M_q * (2**16))
-
-        M_aw    = torch.tensor(self.A_interval * self.B_interval)
-        M_aw    = self.round(M_aw * 2**48)
-
-        M_fa_qb = torch.tensor(self.B_interval)
-        M_fa_qb = self.round(M_fa_qb * 2**24)
-
-        M_qa_fb = torch.tensor(self.A_interval)
-        M_qa_fb = self.round(M_qa_fb * 2**24)
-
-        A_sim = quant_awo(
-            A_normal_fp,
-            self.A_interval,
-            self.A_spec,
-            out_dtype=A.dtype,
-            chunk_size=1_048_576,
-        )
-
-        B_sim = quant_awo(
-            B_normal_fp,
-            self.B_interval,
-            self.B_spec,
-            out_dtype=B.dtype,
-            chunk_size=1_048_576,
-        )
-
-        in_features = A.size(-1)
-        out_features = B.size(-1)
+        """Count masked normal codes once; execute every protected cross term."""
+        A_normal, B_normal, A_protected, B_protected = self._split_outlier_operands(A, B)
+        A_code = quant_awo(A_normal, self.A_interval, self.A_spec,
+                           out_dtype=torch.float32)
+        B_code = quant_awo(B_normal, self.B_interval, self.B_spec,
+                           out_dtype=torch.float32)
         if stat_collector is not None:
             stat_collector.collect_quant_activation(
-                self.layer_name,
-                self.layer_idx,
-                A_sim.to(torch.float16),
-                A_sim.to(torch.float16),
-                B_sim,
-                self.B_spec,
-                self.A_spec,
-                self.digit_size,
-                self.parallelism,
-                in_features,
-                out_features
+                self.layer_name, self.layer_idx, A_code, A_code, B_code,
+                self.B_spec, self.A_spec, self.digit_size, self.parallelism,
+                A.size(-1), B.size(-1), outlier_masked=True,
             )
 
-        A_sim_fp32 = A_sim.to(torch.float32)
-        B_sim_fp32 = B_sim.to(torch.float32)
-        """
-        out_qa_qb = F.linear(x_normal_fp, w_normal_fp, bias)  # 量化的 normal 部分乘积，INT32 范围
-        out_fa_fb = F.linear(x_fp, w_fp)  # 保留 FP16 的 outlier 部分乘积，FP32 范围
-        out_fa_qb = F.linear(x_fp, w_normal_fp)  # 保留 FP16 的 outlier 部分乘积，FP32 范围
-        out_qa_fb = F.linear(x_normal_fp, w_fp)  # 保留 FP16 的 outlier 部分乘积，FP32 范围
-
-        """
-        out_qa_qb = self._matmul(A_sim_fp32, B_sim_fp32)  # 量化的 normal 部分乘积，INT32 范围
-        out_fa_fb = self._matmul(A_fp, B_fp)  # 保留 FP16 的 outlier 部分乘积，FP32 范围
-        out_fa_qb = self._matmul(A_fp, B_sim_fp32)  # 保留 FP16 的 outlier 部分乘积，FP32 范围
-        out_qa_fb = self._matmul(A_sim_fp32, B_fp)  # 保留 FP16 的 outlier 部分乘积，FP32 范围
-
-        out_qa_qb = out_qa_qb.mul_(M_aw)
-        out_qa_qb = torch.div(out_qa_qb, 2**48)
-
-        out_fa_qb = out_fa_qb.mul_(M_fa_qb)
-        out_fa_qb = torch.div(out_fa_qb, 2**24)
-
-        out_qa_fb = out_qa_fb.mul_(M_qa_fb)
-        out_qa_fb = torch.div(out_qa_fb, 2**24)
-
-        #out_ref_qa_qb = F.linear(x_normal_fp.to(torch.float32), w_normal_fp.to(torch.float32), self.bias.to(torch.float32))
-        #mse_qaqb = F.mse_loss(out_qa_qb, out_ref_qa_qb).item()
-        if outliermore:
-            out_with_outlier = out_qa_qb + out_fa_fb + out_fa_qb + out_qa_fb
-        else:
-            out_with_outlier = out_qa_qb + out_fa_fb
-        #return  out_with_outlier.to(x.dtype)
-
-        #out_ref = F.linear(x, self.weight, self.bias)
-        #mse = F.mse_loss(out_with_outlier, out_ref).item()
-
-        out_with_outlier_mask = self.get_outlier_mask_channel(out_with_outlier, self.outlier_ratio)
-        out_without_outlier_mask = ~out_with_outlier_mask
-
-        out_outlier = out_with_outlier * out_with_outlier_mask.to(torch.float32)        # outlier，保留 FP16
-        out_normal = out_with_outlier * out_without_outlier_mask.to(torch.float32)  # normal，FP16（待量化）
-
-        out_normal_quant = quant_awo(
-            out_normal,
-            self.O_interval,
-            self.O_spec,
-            out_dtype=out_normal.dtype,
-            chunk_size=1_048_576,
-        )
-
-        out_normal_dequant = out_normal_quant.to(torch.float32).mul_(M_q).to(A.dtype)
-        out_normal_dequant = torch.div(out_normal_dequant, 2**16).to(A.dtype)
-        out_outlier = out_outlier.to(A.dtype)
-
-        out = out_normal_dequant + out_outlier
-
-        if torch.isnan(out).max():
-            pass
-
-        return out
+        A_deq, B_deq = A_code * self.A_interval, B_code * self.B_interval
+        out_real = (self._matmul(A_deq, B_deq)
+                    + self._matmul(A_protected, B_protected)
+                    + self._matmul(A_protected, B_deq)
+                    + self._matmul(A_deq, B_protected))
+        if self.O_spec.enabled:
+            channels = self.get_outlier_mask_channel(out_real, self.outlier_ratio)
+            out_mask = channels.view(*([1] * (out_real.ndim - 1)), -1)
+            out_code = quant_awo(out_real.masked_fill(out_mask, 0),
+                                 self.O_interval, self.O_spec, out_dtype=torch.float32)
+            out_real = torch.where(out_mask, out_real, out_code * self.O_interval)
+        return out_real.to(A.dtype)
 
     def _classify_token_importance(
         self,
@@ -1036,6 +742,11 @@ class QuantizedMatMul(nn.Module):
 
     def get_outlier_mask_channel(self, tensor: torch.Tensor, ratio: float) -> torch.Tensor:
         """带 outlier 保护的量化前向计算。"""
+
+        if not 0 <= ratio <= 1:
+            raise ValueError("outlier_ratio must be in [0, 1]")
+        if ratio == 0 or tensor.numel() == 0:
+            return torch.zeros(tensor.shape[-1], dtype=torch.bool, device=tensor.device)
 
         # 兼容 [B, S, H] 和 [1, H] / [S, H] / [H] 等各种情况
         tensor_2d = tensor.reshape(-1, tensor.shape[-1])   # [N, H]

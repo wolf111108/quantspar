@@ -148,8 +148,9 @@ class BitSparsityTests(unittest.TestCase):
         self.assertFalse(q['quantization']['mixed_precision'])
         for name, layer in q['quantization'].items():
             if isinstance(layer, dict) and 'outlier_ratio' in layer:
-                self.assertEqual(layer['outlier_ratio'], 0, name)
-        self.assertIn('strict_v2', q['quantization']['scale_dir'])
+                expected = 0 if name in {'qk_matmul', 'pv_matmul'} else 0.0001
+                self.assertEqual(layer['outlier_ratio'], expected, name)
+        self.assertIn('outlier_v3', q['quantization']['scale_dir'])
 
     def test_native_fp16_templates_have_isolated_scales_and_valid_context(self):
         for path, family in (('opt_1.3b_linear_matmul_fp16.yaml', 'opt'),
@@ -185,8 +186,11 @@ class SavedModelPipelineTests(unittest.TestCase):
         torch.set_num_threads(1)
         self.addCleanup(torch.set_num_threads, previous_threads)
         for family in ('opt', 'qwen2'):
-            for fmt in ('int8', 'f8i4', 'fp16'):
-                with self.subTest(family=family, format=fmt), tempfile.TemporaryDirectory() as directory:
+            for variant in ('int8', 'f8i4', 'fp16', 'int8_outlier', 'f8i4_outlier', 'fp16_outlier'):
+                fmt = variant.removesuffix('_outlier')
+                masked = variant.endswith('_outlier')
+                ratio = .0001 if masked else 0.
+                with self.subTest(family=family, format=variant), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     model_dir = root/'model'
                     torch.manual_seed(9)
@@ -208,9 +212,9 @@ class SavedModelPipelineTests(unittest.TestCase):
                     quant = dict(model_family=family, quantize_linear=True, quantize_matmul=True,
                         scale_dir=str(root/'scales'), mixed_precision=False, calibration_policy={'default':'recalibrate'})
                     for name in names:
-                        quant[name] = dict(a_bit=a_bit, w_bit=w_bit, o_bit=a_bit, outlier_ratio=0.)
+                        quant[name] = dict(a_bit=a_bit, w_bit=w_bit, o_bit=a_bit, outlier_ratio=ratio)
                     for name in ('qk_matmul','pv_matmul'):
-                        quant[name] = dict(A_bit=a_bit, B_bit=a_bit, O_bit=a_bit, outlier_ratio=0.)
+                        quant[name] = dict(A_bit=a_bit, B_bit=a_bit, O_bit=a_bit, outlier_ratio=ratio)
                     config = dict(model={'family':family, 'attn_implementation':'eager'}, quantization=quant,
                         calibration=dict(dataset='local-test', num_samples=1, seq_length=8),
                         evaluation=dict(datasets=[dict(name='local-test', streaming=True, seq_length=8,
@@ -232,19 +236,26 @@ class SavedModelPipelineTests(unittest.TestCase):
                     full = json.loads((root/'stats/config_full_forward_bit_sparsity.json').read_text())
                     pd = json.loads((root/'stats/config_prefill_decode_bit_sparsity.json').read_text())
                     self.assertGreater(full['total']['bits'], 0)
+                    self.assertEqual(full['outlier_sparsity']['present'], masked)
+                    self.assertEqual(pd['outlier_sparsity']['present'], masked)
                     self.assertEqual({r['phase'] for r in pd['records']}, {'prefill','decode'})
                     self.assertEqual({r['operand'] for r in pd['records']}, {'activation','weight','Q','K','attention_probs','V'})
                     for row in pd['records']:
                         expected = (4 if row['operand']=='weight' else 3) if fmt == 'f8i4' else (8 if fmt=='int8' else 10)
                         self.assertEqual(row['counted_width'], expected)
+                        self.assertEqual(row['outlier_masked'], masked)
                         self.assertTrue(0 <= row['bit_zero_ratio'] <= 1)
                         if row['operand'] == 'weight':
-                            self.assertEqual(row['observations'], 1)
+                            expected_calls = 2 if masked and row['phase'] == 'decode' else 1
+                            self.assertEqual(row['observations'], expected_calls)
                     self.assertFalse((root/'stats/unit_sparsity').exists())
                     text = next((root/'reports').glob('*.txt')).read_text()
                     self.assertIn('ppl: sum zero bits', text)
                     self.assertIn('prefill_decode: sum zero bits', text)
                     self.assertIn('Perplexity:', text)
+                    if masked:
+                        self.assertIn('mask zeros included', text)
+                        self.assertIn('high-precision sidepath operands excluded', text)
 
 
 if __name__ == '__main__':

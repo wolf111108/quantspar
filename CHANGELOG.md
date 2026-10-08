@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-08 — Allow masked outlier bit sparsity in OPT/Qwen
+
+- 目的：按用户指定口径，允许带 outlier sidepath 的量化推理采集 normal 操作数稀疏度，接受 mask 人为产生的零，继续统一 FP 显式尾数并默认关闭 unit。
+- 内容：Linear/MatMul 将 full-shape masked normal codes 接入纯稀疏统计器，四项数值分支全部执行，normal 操作数各计一次，不额外计 protected 分支。带输入相关 mask 的 W 每次 forward 重新统计，关闭其静态计数缓存；无 outlier 的 W 仍每阶段一次。JSON schema 升为 2，CSV/JSON/TXT 新增 outlier_masked/counting 和 mask 零计入、protected 编码排除的范围说明，masked/unmasked 汇总分开。默认七类 Linear 恢复 outlier_ratio=0.0001，QK/PV 保持零且代码支持正比例，独立 outlier-v3 scales 重新校准。旁路改为 FP32 codes 乘实际 scale 的真实值域四项计算、bias 加一次和真实 O scale 还原，修复固定移位近似导致小 scale 截零、除法前 half 溢出及 INT16 code 失真；Linear 校准/推理共用保形 mask 和 channel W scale，MatMul 始终沿 B 的 K 轴保护，修复方阵轴歧义。主入口 collect_mapping=False 允许 outlier，硬件 collector 仍拒绝忽略旁路成本的映射；更新说明和 README。
+- 验证：真实 PyTorch 2.6.0+cpu、Transformers 4.43.1 下全部 92 项 unittest 通过（86 项既有、6 项新增）；小型 OPT/Qwen 的 INT8、FP8/INT4、FP16 各验证无 outlier/有 outlier，共 12 组实际保存加载、校准、PPL 与 prefill/decode 流程，本地替换数据 loader。新增独立数值/编码参考验证随 mask 变化的 W 计数、mask 零与加权 JSON/CSV、1D–4D Linear/channel scale/bias/多种输出、方阵与 2D–4D QK/PV、极小 scale、half 输入 INT16、masked/unmasked 范围隔离及映射/EBB/Bitlet 拒绝；unit 默认关闭。compileall 和 diff 检查通过。
+- 限制与旧结果影响：未运行完整 OPT/Qwen checkpoint、14B、CUDA、真实 FineWeb 或硬件。比例仅描述 full-shape normal 量化编码，mask 零按用户要求计入，高精度 protected 编码及四项硬件成本不进入统计，不代表完整旁路存储比例或架构加速。默认恢复 outlier、masked W 改为每调用计数、旁路 scale 与数值行为修正，旧 strict-v2/旧旁路的比例和 PPL 需重新校准采集，不能混称相同设置；schema 1 消费脚本需兼容新增字段/版本。无 outlier 数值、FP 尾数/INT 补码口径和静态 W 去重保持不变，原生 FP16 YAML 保持无 outlier；各架构周期公式未修改。
+
 ## 2026-10-08 — Fix OPT/Qwen bit sparsity pipeline and native FP16
 
 - 目的：接通当前 OPT/Qwen 校准、量化、PPL 与 prefill/decode 的编码比特稀疏度采集，用统一的 FP 显式尾数口径统计激活、静态权重及动态 K/V，暂时默认关闭 unit。

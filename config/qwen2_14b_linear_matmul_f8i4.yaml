@@ -16,9 +16,10 @@ quantization:
   quantize_linear: true
   quantize_matmul: true
 
-  # Strict FP8/INT4 run: recalibrate every operator without the old outlier sidepath.
-  # Do not copy INT8 or outlier-protected scales into this directory.
-  scale_dir: quant/scales/qwen2_14b_linear_matmul_f8i4_strict_v2/
+  # Linear outliers are retained in the numerical forward.
+  # Sparsity counts full-shape normal codes, including mask-generated zeros.
+  # Recalibrate; do not copy INT8, strict-v2 or legacy outlier scales here.
+  scale_dir: quant/scales/qwen2_14b_linear_matmul_f8i4_outlier_v3/
   mixed_precision: false
   calibration_policy:
     default: auto
@@ -42,7 +43,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0
+    outlier_ratio: 0.0001
     p: 4
 
   k_proj:
@@ -50,7 +51,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0
+    outlier_ratio: 0.0001
     p: 4
 
   v_proj:
@@ -58,7 +59,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0
+    outlier_ratio: 0.0001
     p: 4
 
   o_proj:
@@ -66,7 +67,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0
+    outlier_ratio: 0.0001
     p: 4
 
   gate_proj:
@@ -74,7 +75,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0
+    outlier_ratio: 0.0001
     p: 4
 
   up_proj:
@@ -82,7 +83,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0
+    outlier_ratio: 0.0001
     p: 4
 
   down_proj:
@@ -90,7 +91,7 @@ quantization:
     w_bit: 4
     o_bit: "e4m3"
     d_bit: "e4m3"
-    outlier_ratio: 0.0
+    outlier_ratio: 0.0001
     p: 4
 
   qk_matmul:

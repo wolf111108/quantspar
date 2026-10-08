@@ -116,5 +116,5 @@ python -m scripts.profile_fp8_int4 \
 - 层覆盖、GQA/KV cache 与 PPL 仅用本地小型 OPT/Qwen 验证；完整 checkpoint 精度/PPL、CUDA 数值和运行内存尚未验证。
 - explicit-mantissa 模型不包含 hidden-one、指数对齐及固定控制成本。1.0 的尾数是零，可能得到零“所选位成本”，但 FP8 乘法仍有实际工作；需要由硬件模型补充这些成本，不能据此声称无限物理加速。
 - W 稀疏度单独统计，不默认乘入 activation 稀疏加速比。权重位串行、零权重跳过、权重写入和存储压缩必须按目标架构另外建模。
-- 已启用 outlier sidepath 的计算不属于严格 FP8/INT4；统计器拒绝省略其成本的映射倍率采集。该数值 sidepath 和混精完整流程不在本次认证范围内。
+- 已启用 outlier sidepath 时，普通主入口可统计量化 normal 部分并接受 mask 零，详见当前比特稀疏度说明；高精度分支不进入该比例。硬件映射仍拒绝省略旁路成本的倍率采集。数值旁路仅用本地小型 OPT/Qwen 验证，混精完整流程不在认证范围内。
 

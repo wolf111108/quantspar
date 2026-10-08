@@ -4,7 +4,7 @@
 
 ## 运行
 
-先安装 `requirements-model.txt`。严格 FP8/INT4：
+先安装 `requirements-model.txt`。默认 FP8/INT4 配置保留 Linear outlier 旁路，统计量化 normal 部分并计入 mask 零：
 
 ```bash
 python 0103_quant_pipeline_main.py \
@@ -16,6 +16,8 @@ python 0103_quant_pipeline_main.py \
 ```
 
 `all` 同时评估 PPL 和 prefill/decode；`ppl` 只评估 PPL，`pd` 只采集 prefill/decode。三者都会先按 calibration policy 处理 scale。默认 FP8/INT4 YAML 仍是 64 个校准样本、8192-token 校准长度，profiling 为 2048＋64；只选择 `pd` 不会缩短校准。
+
+七类 Linear 的默认 `outlier_ratio` 为 `0.0001`，QK/PV 默认为零；QK/PV 也支持显式设置正比例后采集同一口径。若需要严格无旁路实验，把所有 outlier 设零并使用独立 scale 目录。已有架构映射入口继续使用它们自己的无 outlier 配置。
 
 原生 FP16 配置：
 
@@ -40,16 +42,21 @@ unit 默认关闭：统计器、CLI 和默认 YAML 都关闭，旧 YAML 的 `uni
 - `<run>_prefill_decode_bit_sparsity.json/.csv`：prefill 和 decode 分别统计。
 - `<run>_<timestamp>.txt`：PPL 结果和两个流程的比特稀疏度快照。
 
-未指定 `--stats-output-dir` 时，JSON/CSV 也会保存到 `--results-dir`。CSV 按 phase、层名、层号、操作数、格式分行；JSON 额外包含各 phase/操作数及全体计数的汇总。PPL 数据在进入 prefill/decode、清空统计器之前导出。
+未指定 `--stats-output-dir` 时，JSON/CSV 也会保存到 `--results-dir`。CSV 按 phase、层名、层号、操作数、格式及 `outlier_masked` 分行；JSON 额外包含各 phase/操作数/mask 口径及全体计数的汇总。PPL 数据在进入 prefill/decode、清空统计器之前导出。
 
 | 操作数 | 来源 | 计数频率 |
 |---|---|---|
 | activation | Linear 输入 A | 每次量化 forward |
-| weight | Linear 静态 W | 每层、每阶段一次 |
+| weight | 无 outlier 的 Linear 静态 W | 每层、每阶段一次 |
+| weight（outlier_masked=true） | Linear 中随当前输入 mask 改变的 normal W | 每次量化 forward，禁用静态计数缓存 |
 | Q / K | QK MatMul 的 A / B | 每次量化 forward |
 | attention_probs / V | PV MatMul 的 A / B | 每次量化 forward |
 
 K/V 统计描述参与 attention 的量化操作数。decode 延续已有 GQA packing，共享的 K/V 不按 query head 重复统计；prefill 按实际展开后的计算操作数统计。历史 cache 会在后续 decode 中反复参与计算，因此动态计数不是“缓存中每个存储元素只计一次”。全体汇总是上述计数频率下的混合操作数比例，比较模型时应优先看各 phase/操作数行。它不是全模型唯一参数的存储稀疏度。
+
+outlier 统计保留 normal 张量原始形状，protected 位置置零后参与统计，分母包含这些位置；不筛除 mask 零，也不额外统计高精度 protected 操作数。四项数值运算照常执行，量化 normal A/W/B 各计一次，不因在交叉项中复用而重复计数。JSON schema 版本为 2，`outlier_sparsity` 明确记录 `mask_generated_zeros: included`、`high_precision_sidepath_counted: false`；各行还有 `outlier_masked` 和 `counting`，TXT 也标注范围。
+
+直接调用模块时使用 `QuantStatManager(..., collect_mapping=False)` 即可收集 outlier 编码稀疏度。映射或 EBB/Bitlet/BitWave/Slim-Llama collector 仍拒绝 outlier，原因是旁路及交叉项的硬件成本尚未建模；普通主入口已配置为纯稀疏度采集。
 
 | 格式 | 每个元素参与统计的位 | 编码 |
 |---|---:|---|
@@ -93,7 +100,7 @@ bit_zero_ratio = sum(zero_bits) / sum(counted_bits)
 
 默认配置未启用 `kv_cache.fp8_static`；K/V 在 MatMul 读取时量化，HF cache 仍是模型 dtype 的浮点张量。K/V 的尾数统计不能当作已实现 FP8 cache 打包存储的证明。另需注意 YAML 的数字 `8` 表示 INT8，FP8 要写 `e4m3` 或 `e5m2`。
 
-原来七类 Linear 的 `outlier_ratio: 0.0001` 都为正。激活按通道最大绝对值排序，保护数为 `max(1, int(H * ratio))`。例如 H=5120 时保护 1 个通道，实际通道比例约 0.0195%，不是零；同一通道的所有 token 以及对应权重列都会进入高精度部分。权重另按元素 top-k 保护并合并 mask；阈值相等时实际保护元素数还可能增加。输出又保护高幅值通道。
+默认七类 Linear 的 `outlier_ratio: 0.0001` 都为正。激活按通道最大绝对值排序，保护数为 `max(1, int(H * ratio))`。例如 H=5120 时保护 1 个通道，实际通道比例约 0.0195%，不是零；同一通道的所有 token 以及对应权重列都会进入高精度部分。权重另按元素 top-k 保护并合并 mask；阈值相等时实际保护元素数还可能增加。输出又保护高幅值通道。
 
 该旁路将数据分为 normal 和 protected 两部分，并以四项相加恢复结果：
 
@@ -101,16 +108,18 @@ bit_zero_ratio = sum(zero_bits) / sum(counted_bits)
 x_q @ w_q + x_f @ w_f + x_f @ w_q + x_q @ w_f
 ```
 
-`f` 部分保留原数据的精度，再用浮点计算；代码注释中的“FP16”不意味着它一定由 FP16 加载，旧加载器可能使用 BF16。正常部分被 mask 掉的零也不是自然产生的量化零。只统计 `x_q/w_q` 会漏掉旁路；这些 mask 零还可能抬高稀疏度。统计器因此主动拒绝 outlier 配置，不能删除报错后把剩余计数称为完整 FP8/INT4 统计。
+`f` 部分保留原数据的精度，再用 FP32 表达各项计算；代码注释中的“FP16”不意味着它一定由 FP16 加载，加载器也可能使用 BF16。正常部分被 mask 掉的零不是自然产生的量化零，可能抬高统计稀疏度。当前按用户指定口径接受这些零，统计的是含 mask 零的 normal 操作数；高精度旁路的编码与硬件成本不进入该比例。
 
-本次把七类 Linear 的 outlier 全部置零，显式关闭 mixed precision，并改用 `f8i4_strict_v2` scale 目录。此前用剔除 outlier 后最大值确定的 scale，不能代表包含全部值的新范围；INT8 和 FP8/INT4 的量化网格及范围也不同。旧的“复制 INT8 scale”注释已删除。必须重新校准，关闭旁路之后的精度/PPL变化需要真实 checkpoint 实验确认。
+当前恢复七类 Linear 的 outlier 为 `0.0001`，显式关闭 mixed precision，并使用 `f8i4_outlier_v3` scale 目录。此前关闭 outlier 的 strict-v2 scale，不能直接作为带旁路的 normal 范围；INT8 和 FP8/INT4 的量化网格及范围也不同。旧的“复制 INT8 scale”建议不适用，需重新校准。
+
+旁路同时修复了旧数值实现：normal codes 以 FP32 保存，乘实际 scale 反量化后计算四项，bias 在真实值域加一次；输出 normal 部分按实际 O scale 量化/还原，高精度输出通道保留。移除了固定 16/24/48-bit 移位的近似缩放与除法前转 half，避免小 scale 截零、half 溢出或 INT16 code 失真。Linear 校准与推理共用维度保持的 mask，支持 channel W scale；MatMul 的 B 始终沿 K 轴（倒数第二维）保护，修复方阵时误选最后一维的问题。
 
 原 YAML 的 `model.num_layers: 28` 是未参与 wrapper 遍历的元数据，已移除以免误以为只统计 28 层；wrapper 遍历 checkpoint 中的真实层。
 
 ## 验证与旧结果影响
 
-测试使用真实 PyTorch 2.6.0+cpu、Transformers 4.43.1。保存并加载本地小型 OPT/Qwen，分别跑 INT8、FP8/INT4、FP16 的实际校准、PPL 与 prefill/decode，验证 CSV/JSON、位宽、phase 隔离、静态 W 去重和 unit 默认关闭；测试数据本地生成，没有下载真实 checkpoint 或数据集。另用独立原始编码参考检查 FP 子正规数、尾数零位及 INT4 负值。
+测试使用真实 PyTorch 2.6.0+cpu、Transformers 4.43.1。保存并加载本地小型 OPT/Qwen，分别跑 INT8、FP8/INT4、FP16 的无 outlier 与有 outlier 两种实际校准、PPL 与 prefill/decode，验证 CSV/JSON、位宽、phase 隔离、mask 权重每次重计和 unit 默认关闭；测试数据本地生成，没有下载真实 checkpoint 或数据集。另用独立原始编码参考检查 FP 子正规数、尾数零位及 INT4 负值；旁路参考覆盖 Linear 形状/channel scales/bias/输出格式、方阵及批量 MatMul、极小 scale、half 输入 INT16 codes、mask 零和架构采集拒绝。
 
-旧结果不能直接与本次结果拼接：FP 权重/KV 从 storage 改为 mantissa，FP8 每元素分母从 8 改为 3（E4M3），FP16 从 16 改为 10；全局计数新增 W/KV；比例分母、FP16 数值语义和默认 outlier 策略也改变。需要重新采集；默认 FP8/INT4 与旧 FP16 scale 需要重新校准。硬件 collector 的独立对齐/调度口径不以本文件的尾数统计替代。
+旧结果不能直接与当前结果拼接：此前 FP 权重/KV 从 storage 改为 mantissa，FP8 每元素分母从 8 改为 3（E4M3），FP16 从 16 改为 10；全局计数新增 W/KV，比例分母和 FP16 数值语义改变。当前又恢复默认 outlier，改为包含 mask 零的 normal 统计，masked W 每次重计，且修复旁路数值。旧 strict-v2 或旧旁路的 PPL/比例与新结果不可混称同口径，需重新校准并采集。无 outlier 操作数的数值、位统计及去重行为保持不变。JSON/CSV 新增范围字段，读取旧 schema 的脚本需兼容版本 2。硬件 collector 的独立对齐/调度口径不以本文件的尾数统计替代。
 
 完整 OPT/Qwen checkpoint 的 PPL、14B、CUDA、真实数据集和 GPU 内存开销尚未执行验证。缺失的 BitNet/Qwen3.5/MoE 模块导入暂时注释；本快照不提供这些模型的包装器。

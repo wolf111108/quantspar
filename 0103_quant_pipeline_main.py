@@ -399,10 +399,14 @@ def _export_txt_summary(args, config, stat_manager, results, sparsity_summaries=
     lines.append("BIT SPARSITY (all FP operands: explicit mantissa only)")
     for flow, summary in (sparsity_summaries or {}).items():
         lines.append(f"{flow}: sum zero bits / sum counted bits")
+        if summary["outlier_sparsity"]["present"]:
+            lines.append("  Outlier scope: masked quantized normal operands; mask zeros included; "
+                         "high-precision sidepath operands excluded.")
         for row in summary["phase_operands"]:
             ratio = row["bit_zero_ratio"]
             value = f"{ratio:.4%}" if ratio is not None else "unavailable"
-            lines.append(f"  {row['phase']} / {row['operand']}: "
+            scope = " (outlier masked)" if row["outlier_masked"] else ""
+            lines.append(f"  {row['phase']} / {row['operand']}{scope}: "
                          f"{row['zero_bits']} / {row['bits']} = {value}")
     lines.append("")
 
