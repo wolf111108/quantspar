@@ -3,6 +3,13 @@
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
 
+## 2026-10-08 — Add quantization pipeline entry and perplexity eval scripts
+
+- 目的：记录 OPT/Qwen 量化流水线主入口与独立 PPL 评测、稀疏采集脚本，便于复现校准、评测和 prefill/decode profile 流程。
+- 内容：新增 `0103_quant_pipeline_main.py`（校准、量化、PPL 评测与 prefill/decode 稀疏 profile 的完整流水线入口）、根目录 `perplexity.py`（wikitext/流式数据集 PPL 评测、prefill/decode 稀疏 profile、滑动窗口与对比评测）、`finweb_ppl.py`（FineWeb 流式 token 采集与 PPL 评测）；`run.md` 追加 EBB、bit-arch、asyn-cim 采集命令与输出摘录；`.gitignore` 排除 `*.zip` 与 `e2eltc/`，本地结果压缩包与个人笔记不入库。
+- 验证：三个新脚本 `py_compile` 语法检查通过；`smtqt` 环境（PyTorch/Transformers 可用）下主入口可成功导入并解析 `--help`；未修改任何既有代码，77 项既有测试不受影响。
+- 限制与旧结果影响：`0103_quant_pipeline_main.py` 导入 `quant.bitnet_wrapper` 与 `others.evaluation`，这两个模块在当前仓库中不存在（对应函数位于 `quant/qwen_wrapper.py` 与根目录 `perplexity.py`），运行前需按实际环境调整导入路径；未运行完整 14B、CUDA 或 PPL 数值验证；本提交不改变统计口径、映射、位宽或默认量化行为。
+
 ## 2026-10-06 — Fix Qwen Asyn-CIM profiling and LLMCompass export
 
 - 目的：让严格 IA E4M3/W INT4 的 Qwen 256＋32 完整采集并导出匹配当前 LLMCompass 的计算倍率。
