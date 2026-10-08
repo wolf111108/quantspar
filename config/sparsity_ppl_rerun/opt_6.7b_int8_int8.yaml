@@ -1,0 +1,113 @@
+# FineWeb rerun: FP explicit mantissa only; INT full two's complement.
+# A x W labels refer to Linear; attention K/V uses A format, including mixed rows.
+# Mask-created zeros are counted; protected sidepath codes are excluded.
+# Recalibrate separately. The matrix runner assigns attempt-local scale/output paths.
+model:
+  name: opt-6.7b
+  family: opt
+  dtype: bf16
+  attn_implementation: eager
+quantization:
+  enabled: true
+  mode: quant_forward
+  model_family: opt
+  quantize_linear: true
+  quantize_matmul: true
+  mixed_precision: false
+  scale_dir: quant/scales/sparsity_ppl_rerun/opt_6.7b_int8_int8/
+  calibration_policy:
+    default: recalibrate
+  q_proj:
+    a_bit: 8
+    w_bit: 8
+    o_bit: 8
+    d_bit: 8
+    outlier_ratio: 0.0001
+    p: 4
+  k_proj:
+    a_bit: 8
+    w_bit: 8
+    o_bit: 8
+    d_bit: 8
+    outlier_ratio: 0.0001
+    p: 4
+  v_proj:
+    a_bit: 8
+    w_bit: 8
+    o_bit: 8
+    d_bit: 8
+    outlier_ratio: 0.0001
+    p: 4
+  out_proj:
+    a_bit: 8
+    w_bit: 8
+    o_bit: 8
+    d_bit: 8
+    outlier_ratio: 0.0001
+    p: 4
+  fc1:
+    a_bit: 8
+    w_bit: 8
+    o_bit: 8
+    d_bit: 8
+    outlier_ratio: 0.0001
+    p: 4
+  fc2:
+    a_bit: 8
+    w_bit: 8
+    o_bit: 8
+    d_bit: 8
+    outlier_ratio: 0.0001
+    p: 4
+  qk_matmul:
+    A_bit: 8
+    B_bit: 8
+    O_bit: 8
+    d_bit: 8
+    outlier_ratio: 0.0
+    p: 4
+  pv_matmul:
+    A_bit: 8
+    B_bit: 8
+    O_bit: 8
+    d_bit: 8
+    outlier_ratio: 0.0
+    p: 4
+  lm_head:
+    enabled: false
+calibration:
+  dataset: HuggingFaceFW/fineweb
+  dataset_config: sample-10BT
+  split: train
+  streaming: true
+  text_column: text
+  min_text_tokens: 128
+  num_samples: 64
+  seq_length: 2048
+  batch_size: 1
+  seed: 23
+evaluation:
+  seq_length: 2048
+  max_eval_tokens: 65536
+  min_doc_tokens: 128
+  datasets:
+  - alias: fineweb
+    name: HuggingFaceFW/fineweb
+    config: sample-10BT
+    split: train
+    streaming: true
+    text_column: text
+    seq_length: 2048
+    max_eval_tokens: 65536
+    min_doc_tokens: 128
+prefill_decode_profile:
+  enabled: true
+  prefill_length: 1024
+  decode_steps: 64
+  num_samples: 1
+  max_eval_tokens: 1088
+  streaming: true
+  text_column: text
+  min_doc_tokens: 4096
+unit_sparsity:
+  enabled: false

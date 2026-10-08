@@ -31,6 +31,7 @@ from perplexity import evaluate_perplexity, profile_prefill_decode_sparsity
 from tqdm import tqdm
 from quant.quant_linear import QuantizedLinear
 from quant.quant_matmul import QuantizedMatMul
+from scripts.evaluation_report import export_evaluation_report
 
 def validate_reuse_layers_have_scales(model):
     missing = []
@@ -985,6 +986,8 @@ def evaluate(args, config, model):
 
     # 导出 .txt 汇总报告（--results-dir，默认根目录 results/）  #add
     _export_txt_summary(args, config, stat_manager, results, sparsity_summaries)
+    report_path = export_evaluation_report(args, config, results, sparsity_summaries)
+    print(f"JSON evaluation report saved to: {report_path}")
 
     del model
     torch.cuda.empty_cache()
