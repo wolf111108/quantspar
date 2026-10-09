@@ -99,7 +99,7 @@ def export_evaluation_report(args, config, results, sparsity_summaries):
             "fp_bit_scope": "explicit_mantissa",
             "int_bit_scope": "twos_complement",
             "aggregation": "sum_zero_bits / sum_counted_bits",
-            "mask_generated_zeros": "included",
+            "mask_generated_zeros": "excluded",
             "high_precision_sidepath_counted": False,
             "unit_sparsity": bool(args.unit_sparsity),
         },

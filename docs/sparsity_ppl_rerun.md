@@ -74,7 +74,7 @@ python -m scripts.run_sparsity_ppl_doubling \
 
 PPL 沿用分段评测，每段首 token 不计算 loss，末尾不足整段的 tokens 丢弃；预算不等于预测 token 数。不同模型的 tokenizer、序列长度和文档筛选不同，不能把跨模型数值归因为量化格式的单一影响。
 
-四个量化组的全部 Linear 默认 `outlier_ratio: 0.0001`，BF16 基线为 0，QK/PV 均为 0。所有格式都关闭 mixed precision。normal codes 按完整形状统计，**计入 mask 人为产生的零**，高精度 protected sidepath 数值参与 PPL forward，其 codes 不计入比特比例。带输入相关 mask 的 W 每次 forward 重计，无 mask 的静态 W 每阶段计一次。
+四个量化组的全部 Linear 默认 `outlier_ratio: 0.0001`，BF16 基线为 0，QK/PV 均为 0。所有格式都关闭 mixed precision。normal codes 只统计未被 outlier mask 保护的归约通道，**排除 mask 人为产生的零**；高精度 protected sidepath 数值参与 PPL forward，其 codes 不计入比特比例。带输入相关 mask 的 W 每次 forward 重计，无 mask 的静态 W 每阶段计一次。此口径变更后旧稀疏度结果需重新采集；数值量化和校准 scale 不变。
 
 需要对照无旁路的实验，在原命令中加 `--outlier-ratio 0`，建议配合新的 `--output-dir`。该参数默认同时覆盖全部 Linear（包括 BF16）及 QK/PV；若需两者使用不同的比例，用 `--qk-pv-outlier-ratio` 显式覆盖 QK/PV（进入指纹，优先级高于 `--outlier-ratio`）；`summary.csv` 的 `linear_outlier_ratio` 与 `qk_pv_outlier_ratio` 两列分别记录两者的有效值。
 

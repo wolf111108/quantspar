@@ -43,7 +43,8 @@ class MatrixTests(unittest.TestCase):
             # A second group has very different size and ratio; average=0.5 is wrong.
             rows.append(dict(phase=phase, operand="activation", outlier_masked=True,
                              elements=1, zero_elements=1, bits=10, zero_bits=9))
-        return dict(schema_version=2, bit_scope="mantissa", records=[], phase_operands=rows,
+        return dict(schema_version=3, bit_scope="mantissa", records=[], phase_operands=rows,
+                    outlier_sparsity={"mask_generated_zeros": "excluded"},
                     total=dict(bits=1, zero_bits=1, bit_zero_ratio=1.0))
 
     def executor(self, command, *, cwd, stdout, stderr, check, outcomes=None):

@@ -254,7 +254,7 @@ class SavedModelPipelineTests(unittest.TestCase):
                     self.assertIn('prefill_decode: sum zero bits', text)
                     self.assertIn('Perplexity:', text)
                     if masked:
-                        self.assertIn('mask zeros included', text)
+                        self.assertIn('outlier mask channels excluded', text)
                         self.assertIn('high-precision sidepath operands excluded', text)
 
 

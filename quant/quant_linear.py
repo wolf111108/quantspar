@@ -1027,9 +1027,10 @@ class QuantizedLinear(nn.Linear):
         weight_channels = self.get_outlier_mask_channel(self.weight, self.outlier_ratio)
         return activation_channels | weight_channels
 
-    def _split_outlier_operands(self, x):
+    def _split_outlier_operands(self, x, channels=None):
         """Return full-shape normal/protected tensors; masked zeros stay present."""
-        channels = self._get_operand_outlier_channels(x)
+        if channels is None:
+            channels = self._get_operand_outlier_channels(x)
         x_mask = channels.view(*([1] * (x.ndim - 1)), -1)
         w_mask = channels.view(1, -1)
         x_float, w_float = x.float(), self.weight.float()
@@ -1040,7 +1041,8 @@ class QuantizedLinear(nn.Linear):
 
     def _quant_forward_with_outlier(self, x, stat_collector=None):
         """Quantize normal operands and retain all protected cross terms."""
-        x_normal, w_normal, x_protected, w_protected = self._split_outlier_operands(x)
+        channels = self._get_operand_outlier_channels(x)
+        x_normal, w_normal, x_protected, w_protected = self._split_outlier_operands(x, channels)
         x_code = quant_awo(x_normal, self.a_interval, self.a_spec,
                            out_dtype=torch.float32)
         w_scale = torch.as_tensor(self.w_interval, device=self.weight.device,
@@ -1053,6 +1055,7 @@ class QuantizedLinear(nn.Linear):
                 self.layer_name, self.layer_idx, x_code, x_code, w_code,
                 self.w_spec, self.a_spec, self.digit_size, self.parallelism,
                 self.in_features, self.out_features, outlier_masked=True,
+                outlier_keep_channels=~channels,
             )
 
         x_deq, w_deq = x_code * self.a_interval, w_code * w_broadcast

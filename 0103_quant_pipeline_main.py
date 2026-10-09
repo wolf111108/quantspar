@@ -406,7 +406,7 @@ def _export_txt_summary(args, config, stat_manager, results, sparsity_summaries=
     for flow, summary in (sparsity_summaries or {}).items():
         lines.append(f"{flow}: sum zero bits / sum counted bits")
         if summary["outlier_sparsity"]["present"]:
-            lines.append("  Outlier scope: masked quantized normal operands; mask zeros included; "
+            lines.append("  Outlier scope: masked quantized normal operands; outlier mask channels excluded; "
                          "high-precision sidepath operands excluded.")
         for row in summary["phase_operands"]:
             ratio = row["bit_zero_ratio"]

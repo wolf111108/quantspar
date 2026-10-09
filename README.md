@@ -20,7 +20,7 @@ python -m scripts.profile_asyn_cim --model-path /path/to/Qwen2.5-14B --output-di
 
 默认关闭混精。需要严格 IA FP8 / W INT4 时使用 `mixed_precision=False`、`outlier_ratio=0`。数值仿真使用浮点运算表达量化后的网格，不包含原生 INT4 kernel 或打包存储实现。
 
-普通比特稀疏度入口允许 outlier；默认 Linear 比例为 0.0001，统计 normal codes 的完整形状并计入 mask 产生的零。高精度旁路保留在数值推理中，不计入该比例；含 mask 的 W 按每次 forward 重计。FP 仍只计尾数，unit 默认关闭。默认 scales 使用独立 outlier-v3 目录，需重新校准；硬件映射入口继续要求 outlier=0。
+普通比特稀疏度入口允许 outlier；默认 Linear 比例为 0.0001，仅统计未被 outlier mask 保护的 normal codes，不计入 mask 产生的零。高精度旁路保留在数值推理中，不计入该比例；含 mask 的 W 按每次 forward 重计。FP 仍只计尾数，unit 默认关闭。默认 scales 使用独立 outlier-v3 目录；统计口径变化只需重新采集稀疏度，无需重新校准。硬件映射入口继续要求 outlier=0。
 
 OPT-1.3B、OPT-6.7B、Qwen2.5-7B 的 FineWeb 重跑矩阵已提供 15 份配置（BF16/BF16、FP8/FP8、INT8/INT8、INT8/INT4、FP8/INT4）。本地顺序校准、PPL 与 prefill/decode，自动导出加权比特比例和 PPL 汇总：
 

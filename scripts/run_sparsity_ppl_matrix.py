@@ -33,7 +33,7 @@ METRIC = {
     "fp_bit_scope": "explicit_mantissa",
     "int_bit_scope": "twos_complement",
     "aggregation": "sum_zero_bits / sum_counted_bits",
-    "mask_generated_zeros": "included",
+    "mask_generated_zeros": "excluded",
     "high_precision_sidepath_counted": False,
     "unit_sparsity": False,
 }
@@ -172,7 +172,9 @@ def read_report(job, attempt):
         flows["prefill_decode"] = ("prefill", "decode")
     for flow, phases in flows.items():
         snapshot = doc.get("bit_sparsity", {}).get(flow)
-        if snapshot is None or snapshot.get("schema_version") != 2 or snapshot.get("bit_scope") != "mantissa":
+        if (snapshot is None or snapshot.get("schema_version") != 3 or
+                snapshot.get("outlier_sparsity", {}).get("mask_generated_zeros") != "excluded" or
+                snapshot.get("bit_scope") != "mantissa"):
             raise ValueError(f"Missing or incompatible {flow} bit statistics")
         for extension in ("json", "csv"):
             stats_path = attempt / "stats" / f"{job['run_name']}_{flow}_bit_sparsity.{extension}"
@@ -191,7 +193,7 @@ def read_report(job, attempt):
             for operand in OPERANDS:
                 selected = [row for row in phase_rows if row["operand"] == operand]
                 total = sum_counts(selected)
-                if not total["bits"]:
+                if not selected or (not total["bits"] and not all(row["outlier_masked"] for row in selected)):
                     raise ValueError(f"Missing {phase}/{operand} bit counts")
                 summary[f"{phase}_{operand}_bit_zero_ratio"] = total["bit_zero_ratio"]
             # Retain masked and unmasked groups, with recomputed weighted ratios.
@@ -232,7 +234,7 @@ def save_results(output, manifest):
 def run_matrix(args, executor=subprocess.run):
     jobs = build_jobs(args)
     output = args.output_dir.expanduser().resolve()
-    print(f"{len(jobs)} jobs; FP explicit mantissa; mask zeros included; unit disabled", flush=True)
+    print(f"{len(jobs)} jobs; FP explicit mantissa; outlier mask channels excluded; unit disabled", flush=True)
     if args.dry_run:
         for job in jobs:
             config = job["config"]

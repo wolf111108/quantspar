@@ -49,7 +49,7 @@ class OutlierSparsityTests(unittest.TestCase):
         op.save_scales()
         op.mode = 'quant_forward'
 
-    def test_mask_zeros_counts_refresh_weights_each_call_and_export_scope(self):
+    def test_mask_channels_excluded_and_weights_refresh_each_call(self):
         op = QuantizedLinear(4, 2, bias=False, a_bit='e4m3', w_bit=4,
                              o_bit='none', outlier_ratio=.0001,
                              scale_root_str=self.tmp.name)
@@ -66,27 +66,31 @@ class OutlierSparsityTests(unittest.TestCase):
              mock.patch('quant.stat_manager.unit_sparse_counts', side_effect=AssertionError('units called')):
             for x in (first, second):
                 torch.testing.assert_close(op(x, stat_collector=sm), op(x), rtol=0, atol=0)
-        # W codes for the two input-dependent masks are:
-        # [0,4,6,0; 0,0,7,0] and [2,4,0,0; 2,0,0,0].
-        # Integer bit counts below are scalar two's-complement references.
-        expected_weight_zeros = 64 - sum(v.bit_count() for v in (0,4,6,0,0,0,7,0,2,4,0,0,2,0,0,0))
+        # Retained W codes: [4,6; 0,7] and [2,4; 2,0].
+        # The two natural zeros remain, but masked channels never enter counts.
+        expected_weight_zeros = 32 - sum(v.bit_count() for v in (4,6,0,7,2,4,2,0))
         doc = sm.export_sparsity_stats(Path(self.tmp.name)/'outlier.json', Path(self.tmp.name)/'outlier.csv')
         weight = next(row for row in doc['records'] if row['operand'] == 'weight')
         activation = next(row for row in doc['records'] if row['operand'] == 'activation')
-        self.assertEqual(weight['bits'], 64)
+        self.assertEqual(weight['elements'], 8)
+        self.assertEqual(weight['zero_elements'], 2)
+        self.assertEqual(weight['bits'], 32)
         self.assertEqual(weight['zero_bits'], expected_weight_zeros)
         self.assertEqual(weight['observations'], 2)
         self.assertEqual(weight['counting'], 'each_quantized_forward')
-        self.assertEqual(activation['zero_elements'], 4)
-        self.assertEqual(activation['bits'], 24)
-        self.assertEqual(activation['zero_bits'], 16)  # two zero mantissas and two 0x7e codes per call
-        self.assertEqual(doc['total']['bits'], 88)
-        self.assertEqual(doc['total']['bit_zero_ratio'], (16 + expected_weight_zeros)/88)
+        self.assertEqual(activation['elements'], 4)
+        self.assertEqual(activation['zero_elements'], 0)
+        self.assertEqual(activation['bits'], 12)
+        self.assertEqual(activation['zero_bits'], 4)  # four 0x7e codes, one zero mantissa bit each
+        self.assertEqual(doc['total']['bits'], 44)
+        self.assertEqual(doc['total']['bit_zero_ratio'], (4 + expected_weight_zeros)/44)
+        self.assertEqual(sm.total_element_count, doc['total']['elements'])
+        self.assertEqual(sm.total_bit_count, doc['total']['bits'])
         self.assertEqual(sm._static_weight_counts, {})
         self.assertTrue(all(row['outlier_masked'] for row in doc['records']))
-        self.assertEqual(doc['schema_version'], 2)
+        self.assertEqual(doc['schema_version'], 3)
         self.assertTrue(doc['outlier_sparsity']['present'])
-        self.assertEqual(doc['outlier_sparsity']['mask_generated_zeros'], 'included')
+        self.assertEqual(doc['outlier_sparsity']['mask_generated_zeros'], 'excluded')
         self.assertFalse(doc['outlier_sparsity']['high_precision_sidepath_counted'])
         with (Path(self.tmp.name)/'outlier.csv').open() as stream:
             rows = list(csv.DictReader(stream))
@@ -182,8 +186,9 @@ class OutlierSparsityTests(unittest.TestCase):
                             rows = sm.get_sparsity_summary()['records']
                             b_role = 'K' if name == 'qk_matmul' else 'V'
                             row = next(r for r in rows if r['operand'] == b_role)
-                            self.assertEqual(row['elements'], B.numel())
-                            self.assertEqual(row['zero_elements'], int((bc == 0).sum()))
+                            keep = ~am.reshape(-1, am.shape[-1])[0]
+                            self.assertEqual(row['elements'], bc.index_select(-2, keep.nonzero().flatten()).numel())
+                            self.assertEqual(row['zero_elements'], int((bc.index_select(-2, keep.nonzero().flatten()) == 0).sum()))
                             self.assertTrue(row['outlier_masked'])
 
     def test_sidepath_mapping_and_hardware_backends_remain_rejected(self):
@@ -204,11 +209,30 @@ class OutlierSparsityTests(unittest.TestCase):
         weight = torch.tensor([[0.,1.]])
         for masked in (True, False):
             sm.collect_quant_activation('q_proj',0,x,x,weight,type_spec(4),type_spec('e4m3'),
-                                         None,None,2,1,outlier_masked=masked)
+                                         None,None,2,1,outlier_masked=masked,
+                                         outlier_keep_channels=torch.tensor([False, True]) if masked else None)
         doc = sm.get_sparsity_summary()
         self.assertEqual(len(doc['records']), 4)
         self.assertEqual(len(doc['phase_operands']), 4)
         self.assertEqual({r['outlier_masked'] for r in doc['records']}, {True,False})
+
+    def test_mask_selector_is_required_and_all_protected_has_no_denominator(self):
+        sm = self.manager()
+        x = torch.tensor([[0., 2.]])
+        w = torch.tensor([[0., 3.]])
+        with self.assertRaisesRegex(ValueError, 'outlier_keep_channels'):
+            sm.collect_quant_activation('q_proj', 0, x, x, w,
+                                        type_spec(4), type_spec('e4m3'), None, None, 2, 1,
+                                        outlier_masked=True)
+        self.assertEqual(sm.sparsity_records, {})
+        sm.collect_quant_activation('q_proj', 0, x, x, w,
+                                    type_spec(4), type_spec('e4m3'), None, None, 2, 1,
+                                    outlier_masked=True,
+                                    outlier_keep_channels=torch.tensor([False, False]))
+        doc = sm.get_sparsity_summary()
+        self.assertEqual(doc['total']['elements'], 0)
+        self.assertEqual(doc['total']['bits'], 0)
+        self.assertIsNone(doc['total']['bit_zero_ratio'])
 
 
 if __name__ == '__main__':

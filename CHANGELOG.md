@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-09 — Exclude outlier mask zeros from sparsity statistics
+
+- 目的：outlier ratio 增大时，mask 人为置零显著抬高量化操作数的元素和 bit 稀疏度。
+- 内容：Linear 与 QK/PV MatMul 将前向使用的同一归约通道 mask 传给统计器；仅对未保护通道的量化 normal A/W/B codes 统计，天然零值仍保留。全局、逐 phase/操作数以及显式启用的 unit 统计同步改变；mask 相关 W 仍每次 forward 重计，输出量化、四项旁路和校准未改。更新报告元数据、矩阵运行器校验、文档和回归断言；统计 JSON schema 升为 3。
+- 验证：Python 语法检查及不依赖模型的矩阵脚本 9 项测试通过；默认环境未提供 PyTorch，未运行需要 PyTorch 的 outlier 单元测试或模型/PPL 实验。
+- 限制与旧结果影响：带 outlier 的旧元素/bit/unit 稀疏度比例及 schema 2 报告与新口径不可直接比较，需重新采集；本次量化前向数值和校准 scale 未变，无需仅为此变更重校准。全部归约通道被保护时分母为零、比例为 null；高精度旁路仍不计入该比例，硬件映射入口仍不支持带旁路的加速倍率。
+
 ## 2026-10-09 — Add quick Qwen7B Linear scale PPL diagnostics
 
 - 目的：定位 Qwen2.5-7B 开启 Linear per-output-channel weight scale 后 PPL 由 19.0183 上升到 20.5306 的来源。

@@ -450,13 +450,17 @@ class QuantizedMatMul(nn.Module):
         return out_real.to(A.dtype)
 
 
-    def _split_outlier_operands(self, A, B):
+    def _get_operand_outlier_channels(self, A, B):
+        return (self.get_outlier_mask_channel(A, self.outlier_ratio)
+                | self.get_outlier_mask_channel(B, self.outlier_ratio,
+                                                channel_dim=-2))
+
+    def _split_outlier_operands(self, A, B, channels=None):
         """Protect the union of both operands' reduction channels."""
         if A.ndim < 2 or B.ndim < 2 or A.shape[-1] != B.shape[-2]:
             raise ValueError("Outlier MatMul requires A[..., M, K] and B[..., K, N]")
-        channels = (self.get_outlier_mask_channel(A, self.outlier_ratio)
-                    | self.get_outlier_mask_channel(B, self.outlier_ratio,
-                                                    channel_dim=-2))
+        if channels is None:
+            channels = self._get_operand_outlier_channels(A, B)
         A_mask = channels.view(*([1] * (A.ndim - 1)), -1)
         B_mask = channels.view(*([1] * (B.ndim - 2)), -1, 1)
         A_float, B_float = A.float(), B.float()
@@ -467,7 +471,8 @@ class QuantizedMatMul(nn.Module):
 
     def _quant_forward_with_outlier(self, A, B, stat_collector=None):
         """Count masked normal codes once; execute every protected cross term."""
-        A_normal, B_normal, A_protected, B_protected = self._split_outlier_operands(A, B)
+        channels = self._get_operand_outlier_channels(A, B)
+        A_normal, B_normal, A_protected, B_protected = self._split_outlier_operands(A, B, channels)
         A_code = quant_awo(A_normal, self.A_interval, self.A_spec,
                            out_dtype=torch.float32)
         B_code = quant_awo(B_normal, self.B_interval, self.B_spec,
@@ -477,6 +482,7 @@ class QuantizedMatMul(nn.Module):
                 self.layer_name, self.layer_idx, A_code, A_code, B_code,
                 self.B_spec, self.A_spec, self.digit_size, self.parallelism,
                 A.size(-1), B.size(-1), outlier_masked=True,
+                outlier_keep_channels=~channels,
             )
 
         A_deq, B_deq = A_code * self.A_interval, B_code * self.B_interval

@@ -2323,12 +2323,16 @@ class QuantStatManager:
 
     def collect_quant_activation(self,layer_name,layer_idx,activation,FP_activation,
                                  weight,weight_spec,spec,digit_size,parallelism,
-                                 in_features,out_features,*,outlier_masked=False):
+                                 in_features,out_features,*,outlier_masked=False,
+                                 outlier_keep_channels=None):
         if outlier_masked and (self.collect_mapping or self.ebb_stats is not None
                                or self.bit_architecture_collectors):
             raise ValueError("Outlier sidepath sparsity requires collect_mapping=False "
                              "and no architecture backend; sidepath compute costs are not modeled")
         if activation is None or spec is None or spec.kind == "none": return
+        if outlier_masked != (outlier_keep_channels is not None):
+            raise ValueError("Masked operands require outlier_keep_channels; "
+                             "unmasked operands must not provide it")
         if self.bit_architecture_collectors:
             context = dict(self.execution_context)
             context.update(self.attention_context.get((layer_name, layer_idx), {}))
@@ -2343,6 +2347,13 @@ class QuantStatManager:
             return self.ebb_stats.collect(layer_name, layer_idx, activation, weight,
                                           spec, weight_spec, in_features, out_features,
                                           self.current_phase, context)
+        if outlier_masked:
+            keep = torch.as_tensor(outlier_keep_channels, device=activation.device)
+            if (keep.dtype != torch.bool or keep.ndim != 1 or
+                    keep.numel() != activation.shape[-1] or
+                    keep.numel() != weight.shape[-2]):
+                raise ValueError("outlier_keep_channels must be a boolean vector on the shared K axis")
+            indices = keep.nonzero(as_tuple=True)[0]
         self.record_collected_layer_name(layer_name,layer_idx)
         context = dict(self.execution_context)
         context.update(self.attention_context.get((layer_name, layer_idx), {}))
@@ -2359,6 +2370,9 @@ class QuantStatManager:
                                             group * activation.shape[-2], activation.shape[-1])
             weight = weight.reshape(weight.shape[0], kv, group,
                                     weight.shape[-2], weight.shape[-1])[:, :, 0]
+        if outlier_masked:
+            activation = activation.index_select(-1, indices)
+            weight = weight.index_select(-2, indices.to(weight.device))
         sparse=sparse_counts(activation,spec,self.bit_scope,chunk_size=self.sparse_stat_chunk_size)
         self.collect_activation_sparsity(*sparse)
         self.collect_unit_sparsity(layer_name,layer_idx,activation,spec)
@@ -2449,14 +2463,14 @@ class QuantStatManager:
                 totals[field] += row[field]
                 entry[field] += row[field]
         return dict(
-            schema_version=2, bit_scope=self.bit_scope,
+            schema_version=3, bit_scope=self.bit_scope,
             aggregation="sum_zero_bits / sum_counted_bits",
             static_weight_counting="once per layer and phase; outlier-masked weights counted each forward",
             dynamic_operand_counting="each quantized forward; existing decode GQA packing applies",
             outlier_sparsity=dict(
                 present=any(row["outlier_masked"] for row in rows),
-                counted_branch="quantized normal operands at full shape",
-                mask_generated_zeros="included",
+                counted_branch="quantized normal operands on unprotected reduction channels",
+                mask_generated_zeros="excluded",
                 high_precision_sidepath_counted=False,
             ),
             total=self._sparsity_ratios(totals), records=rows,
@@ -2488,7 +2502,7 @@ class QuantStatManager:
         for row in self.get_sparsity_summary(phases)["phase_operands"]:
             ratio = row["bit_zero_ratio"]
             value = f"{ratio:.4%}" if ratio is not None else "unavailable"
-            scope = " (outlier mask zeros included)" if row["outlier_masked"] else ""
+            scope = " (outlier mask channels excluded)" if row["outlier_masked"] else ""
             print(f"  {row['phase']} / {row['operand']}{scope}: "
                   f"{row['zero_bits']:,} / {row['bits']:,} = {value}")
 
