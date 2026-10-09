@@ -86,6 +86,19 @@ def safe_scale_per_token(x, spec, dim=-1):
     return torch.where(scale>0,scale,torch.ones_like(scale))
 
 
+def merge_calibration_scale(previous, observed):
+    """Keep the largest calibrated interval across batches, including channel scales."""
+    if previous is None:
+        return observed
+    if isinstance(previous, torch.Tensor) or isinstance(observed, torch.Tensor):
+        observed = torch.as_tensor(observed)
+        previous = torch.as_tensor(previous, device=observed.device, dtype=observed.dtype)
+        if previous.shape != observed.shape:
+            raise ValueError("Calibration scale shape changed between batches")
+        return torch.maximum(previous, observed)
+    return max(previous, observed)
+
+
 def quant_awo(x, scale, spec, out_dtype=None, chunk_size=1_048_576):
     """Return normalized INT/FP codes in an arithmetic-capable float dtype.
 

@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-09 — Aggregate calibration scales and couple outlier ratio overrides
+
+- 目的：修复量化校准只保留最后一个 batch 的 A/W/O scale，并避免矩阵脚本单独覆盖 Linear 旁路时误以为 QK/PV 也跟随。
+- 内容：普通 Linear 和 QK/PV MatMul 校准按 batch 对各自标量或逐输出通道 scale 取最大值；`--outlier-ratio` 默认同时覆盖 Linear 与 QK/PV，显式 `--qk-pv-outlier-ratio` 优先。翻倍驱动器原本已同时覆盖两者，保持其调度语义。更新回归测试与实验说明。
+- 验证：矩阵参数传递的无模型回归测试及 Python 编译检查；当前执行环境缺少 PyTorch，新增校准数值测试留待用户的 PyTorch 环境运行，未运行真实 Qwen/FineWeb PPL。
+- 限制与旧结果影响：默认模板的 QK/PV 仍为 0；显式传入 `--outlier-ratio` 的实验从现在起改变 QK/PV 行为，旧输出不能混用。普通 Linear/QK/PV 模式的旧 scale 仅对应最后 batch，必须使用新目录重新校准并重跑 PPL/稀疏结果；跨批最大值不能保证 Qwen PPL 达标。
+
 ## 2026-10-09 — Promote outliermore to a default-on instance flag
 
 - 目的：把 outlier 掩码中硬编码在函数内的 `outliermore = True` 显式化为实例属性，允许按层关闭 weight 自身 element-wise top-k 并集（仅保留激活 channel mask 掩 weight 列），与用户参考代码的结构对齐；行为保持不变。

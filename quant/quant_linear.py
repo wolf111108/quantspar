@@ -28,6 +28,7 @@ from .quant_spec import (
     parse_quant_spec,
     safe_scale_from_tensor,
     safe_scale_per_token,
+    merge_calibration_scale,
     quant_awo,
     fp8_dtype,
     fp8_max,
@@ -436,15 +437,21 @@ class QuantizedLinear(nn.Linear):
         # Calibration and inference use the same full-shape masks.
         if self.outlier_ratio > 0.0:
             x_normal, w_normal, _, _ = self._split_outlier_operands(x)
-            self.a_interval = safe_scale_from_tensor(x_normal, self.a_spec)
-            self.w_interval = self._weight_scale(w_normal)
+            self.a_interval = merge_calibration_scale(
+                self.a_interval, safe_scale_from_tensor(x_normal, self.a_spec))
+            self.w_interval = merge_calibration_scale(
+                self.w_interval, self._weight_scale(w_normal))
             channels = self.get_outlier_mask_channel(out, self.outlier_ratio)
             out_mask = channels.view(*([1] * (out.ndim - 1)), -1)
-            self.o_interval = safe_scale_from_tensor(out.masked_fill(out_mask, 0), self.o_spec)
+            self.o_interval = merge_calibration_scale(
+                self.o_interval, safe_scale_from_tensor(out.masked_fill(out_mask, 0), self.o_spec))
         else:
-            self.a_interval = safe_scale_from_tensor(x, self.a_spec)
-            self.w_interval = self._weight_scale(self.weight)
-            self.o_interval = safe_scale_from_tensor(out, self.o_spec)
+            self.a_interval = merge_calibration_scale(
+                self.a_interval, safe_scale_from_tensor(x, self.a_spec))
+            self.w_interval = merge_calibration_scale(
+                self.w_interval, self._weight_scale(self.weight))
+            self.o_interval = merge_calibration_scale(
+                self.o_interval, safe_scale_from_tensor(out, self.o_spec))
 
             # Collect statistics if collector is provided
         if stat_collector is not None:

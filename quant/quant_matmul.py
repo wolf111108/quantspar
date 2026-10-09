@@ -31,6 +31,7 @@ from .quant_spec import (       # add
     parse_quant_spec,           # add
     safe_scale_from_tensor,     # add
     safe_scale_per_token,
+    merge_calibration_scale,
     quant_awo,                  # add
     fp8_dtype,                  # add
     fp8_max,                    # add
@@ -312,15 +313,21 @@ class QuantizedMatMul(nn.Module):
             )
         if self.outlier_ratio > 0.0:
             A_normal, B_normal, _, _ = self._split_outlier_operands(A, B)
-            self.A_interval = safe_scale_from_tensor(A_normal, self.A_spec)
-            self.B_interval = safe_scale_from_tensor(B_normal, self.B_spec)
+            self.A_interval = merge_calibration_scale(
+                self.A_interval, safe_scale_from_tensor(A_normal, self.A_spec))
+            self.B_interval = merge_calibration_scale(
+                self.B_interval, safe_scale_from_tensor(B_normal, self.B_spec))
             channels = self.get_outlier_mask_channel(out, self.outlier_ratio)
             out_mask = channels.view(*([1] * (out.ndim - 1)), -1)
-            self.O_interval = safe_scale_from_tensor(out.masked_fill(out_mask, 0), self.O_spec)
+            self.O_interval = merge_calibration_scale(
+                self.O_interval, safe_scale_from_tensor(out.masked_fill(out_mask, 0), self.O_spec))
         else:
-            self.A_interval = safe_scale_from_tensor(A, self.A_spec)
-            self.B_interval = safe_scale_from_tensor(B, self.B_spec)
-            self.O_interval = safe_scale_from_tensor(out, self.O_spec)
+            self.A_interval = merge_calibration_scale(
+                self.A_interval, safe_scale_from_tensor(A, self.A_spec))
+            self.B_interval = merge_calibration_scale(
+                self.B_interval, safe_scale_from_tensor(B, self.B_spec))
+            self.O_interval = merge_calibration_scale(
+                self.O_interval, safe_scale_from_tensor(out, self.O_spec))
         
         if stat_collector is not None:
             stat_collector.collect_matmul_stats(

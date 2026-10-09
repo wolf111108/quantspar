@@ -76,9 +76,9 @@ PPL 沿用分段评测，每段首 token 不计算 loss，末尾不足整段的 
 
 四个量化组的全部 Linear 默认 `outlier_ratio: 0.0001`，BF16 基线为 0，QK/PV 均为 0。所有格式都关闭 mixed precision。normal codes 按完整形状统计，**计入 mask 人为产生的零**，高精度 protected sidepath 数值参与 PPL forward，其 codes 不计入比特比例。带输入相关 mask 的 W 每次 forward 重计，无 mask 的静态 W 每阶段计一次。
 
-需要对照无旁路的实验，在原命令中加 `--outlier-ratio 0`，建议配合新的 `--output-dir`。该参数统一覆盖全部 Linear，包括 BF16，QK/PV 保持为零。若需同时调整 QK/PV 的旁路比例，用 `--qk-pv-outlier-ratio`（同样进入指纹，仅覆盖 `qk_matmul`/`pv_matmul`，不影响 Linear）；`summary.csv` 的 `linear_outlier_ratio` 与 `qk_pv_outlier_ratio` 两列分别记录两者的有效值。
+需要对照无旁路的实验，在原命令中加 `--outlier-ratio 0`，建议配合新的 `--output-dir`。该参数默认同时覆盖全部 Linear（包括 BF16）及 QK/PV；若需两者使用不同的比例，用 `--qk-pv-outlier-ratio` 显式覆盖 QK/PV（进入指纹，优先级高于 `--outlier-ratio`）；`summary.csv` 的 `linear_outlier_ratio` 与 `qk_pv_outlier_ratio` 两列分别记录两者的有效值。
 
-模板使用独立 `quant/scales/sparsity_ppl_rerun/<模型>_<格式>/` 并强制 `calibration_policy.default: recalibrate`。批量脚本进一步将有效 YAML、scales、日志与结果放进每个 attempt 内，避免跨模型、跨格式、跨重跑复用旧 scales；不添加 `--skip-calibration`。
+模板使用独立 `quant/scales/sparsity_ppl_rerun/<模型>_<格式>/` 并强制 `calibration_policy.default: recalibrate`。批量脚本进一步将有效 YAML、scales、日志与结果放进每个 attempt 内，避免跨模型、跨格式、跨重跑复用旧 scales；不添加 `--skip-calibration`。标准 Linear/QK/PV 校准 scale 按每批观测值逐元素取最大值（标量或逐输出通道），不再只使用最后一个 batch；需重新校准后重跑量化 PPL/稀疏统计。
 
 ## 输出和统计口径
 

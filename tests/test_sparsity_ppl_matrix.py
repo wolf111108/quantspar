@@ -198,6 +198,19 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(float(rows[0]["qk_pv_outlier_ratio"]), 0.0002)
         self.assertEqual(rows[0]["attempt"].endswith("attempt_0002"), True)
 
+    def test_linear_ratio_also_covers_attention_unless_explicitly_overridden(self):
+        args = self.args("--formats", "fp8_int4", "--outlier-ratio", "0.05")
+        coupled = runner.build_jobs(args)[0]["config"]["quantization"]
+        self.assertEqual(coupled["q_proj"]["outlier_ratio"], 0.05)
+        self.assertEqual(coupled["qk_matmul"]["outlier_ratio"], 0.05)
+        self.assertEqual(coupled["pv_matmul"]["outlier_ratio"], 0.05)
+        args = self.args("--formats", "fp8_int4", "--outlier-ratio", "0.05",
+                         "--qk-pv-outlier-ratio", "0.0")
+        separate = runner.build_jobs(args)[0]["config"]["quantization"]
+        self.assertEqual(separate["q_proj"]["outlier_ratio"], 0.05)
+        self.assertEqual(separate["qk_matmul"]["outlier_ratio"], 0)
+        self.assertEqual(separate["pv_matmul"]["outlier_ratio"], 0)
+
     def test_failure_and_nonfinite_ppl_continue_without_fake_zero(self):
         args = self.args("--formats", "bf16_bf16", "fp8_fp8", "int8_int8")
         outcomes = {"opt_1.3b_bf16_bf16": "fail", "opt_1.3b_fp8_fp8": float("inf")}

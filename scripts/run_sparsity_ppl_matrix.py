@@ -58,9 +58,9 @@ def parse_args(argv=None):
                         help="all: PPL + prefill/decode; ppl: PPL and full-forward bit stats")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/sparsity_ppl_rerun"))
     parser.add_argument("--outlier-ratio", type=outlier_ratio, default=None,
-                        help="Override every Linear, including BF16; attention stays at zero")
+                        help="Override Linear and QK/PV; an explicit QK/PV ratio takes precedence")
     parser.add_argument("--qk-pv-outlier-ratio", type=outlier_ratio, default=None,
-                        help="Override qk_matmul/pv_matmul outlier ratio (default keeps config values)")
+                        help="Override QK/PV separately (default follows --outlier-ratio or template)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip only validated completed jobs with matching provenance")
     parser.add_argument("--dry-run", action="store_true",
@@ -106,10 +106,12 @@ def build_jobs(args):
                 for settings in config["quantization"].values():
                     if isinstance(settings, dict) and "a_bit" in settings:
                         settings["outlier_ratio"] = args.outlier_ratio
-            if args.qk_pv_outlier_ratio is not None:
+            qk_pv_ratio = (args.qk_pv_outlier_ratio if args.qk_pv_outlier_ratio is not None
+                           else args.outlier_ratio)
+            if qk_pv_ratio is not None:
                 for settings in config["quantization"].values():
                     if isinstance(settings, dict) and "A_bit" in settings:
-                        settings["outlier_ratio"] = args.qk_pv_outlier_ratio
+                        settings["outlier_ratio"] = qk_pv_ratio
             fingerprint_input = {
                 **provenance, "config": config, "model_path": checkpoint,
                 "device": args.device, "eval_flow": args.eval_flow,
