@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-10 — Format tensor calibration scales in summaries
+
+- 目的：修复 Linear weight 使用 per-output-channel scale 时，calibration 汇总和保存日志仍按标量格式化 Tensor 导致流水线在 `Tensor.__format__` 处中断的问题。
+- 内容：`QuantStatManager.print_summary()` 与 `save_all_scales()` 对 Tensor scale 输出 shape、最小值和最大值；标量 scale 保持原来的定点格式。该改动只影响日志展示，不改变 scale 聚合、保存数据或量化数值。
+- 验证：smtqt 环境下 `tests/test_calibration_scales.py`、`tests/test_fp8_int4.py` 共 23 项测试加 4 项子测试通过；随后用 Qwen2.5-7B per-output-channel 配置完成真实 calibration 与 FineWeb PPL 运行，不再触发 Tensor 格式化错误。
+- 限制与旧结果影响：不改量化行为，既有标量 scale 结果无需重跑。per-output-channel 结果仍需独立目录校准，本次验证运行的 PPL 为 20.530632，仅作为流水线可执行性验证而非性能结论。
+
 ## 2026-10-09 — Union activation and weight outlier channels
 
 - 目的：按相同 outlier ratio 独立寻找乘法两侧的大幅值归约通道，并在两侧使用同一个并集 mask。

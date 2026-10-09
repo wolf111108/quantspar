@@ -2902,7 +2902,11 @@ class QuantStatManager:
                 with open(filepath, 'wb') as f:
                     pickle.dump(scale_value, f)
 
-                print(f"  Saved {filename}: {scale_value:.6f}")
+                if torch.is_tensor(scale_value):
+                    print(f"  Saved {filename}: tensor{tuple(scale_value.shape)} "
+                          f"min={scale_value.min().item():.6f} max={scale_value.max().item():.6f}")
+                else:
+                    print(f"  Saved {filename}: {scale_value:.6f}")
 
         print(f"Total scales saved: {len(self.stats)} layers")
 
@@ -2972,7 +2976,12 @@ class QuantStatManager:
             print(f"  Samples: {info['sample_count']}")
             print(f"  Scales:")
             for scale_name, scale_value in info['scales'].items():
-                print(f"    {scale_name}: {scale_value:.6f}")
+                if torch.is_tensor(scale_value):
+                    print(f"    {scale_name}: tensor{tuple(scale_value.shape)} "
+                          f"min={scale_value.min().item():.6f} "
+                          f"max={scale_value.max().item():.6f}")
+                else:
+                    print(f"    {scale_name}: {scale_value:.6f}")
 
         print("="*80 + "\n")
 
