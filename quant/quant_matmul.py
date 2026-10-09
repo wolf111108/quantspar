@@ -444,13 +444,19 @@ class QuantizedMatMul(nn.Module):
 
 
     def _split_outlier_operands(self, A, B):
-        """Protect paired reduction channels, including square QK/PV operands."""
+        """Protect paired reduction channels, including square QK/PV operands.
+
+        When ``outliermore`` is enabled (default), B additionally keeps its own
+        element-wise top-k outliers on the FP16 path, matching the Linear-side
+        reference behavior.
+        """
         if A.ndim < 2 or B.ndim < 2 or A.shape[-1] != B.shape[-2]:
             raise ValueError("Outlier MatMul requires A[..., M, K] and B[..., K, N]")
         channels = self.get_outlier_mask_channel(A, self.outlier_ratio)
         A_mask = channels.view(*([1] * (A.ndim - 1)), -1)
         B_mask = channels.view(*([1] * (B.ndim - 2)), -1, 1)
-        B_mask = B_mask | self._get_outlier_mask_1d(B, self.outlier_ratio)
+        if getattr(self, "outliermore", True):
+            B_mask = B_mask | self._get_outlier_mask_1d(B, self.outlier_ratio)
         A_float, B_float = A.float(), B.float()
         return (A_float.masked_fill(A_mask, 0),
                 B_float.masked_fill(B_mask, 0),

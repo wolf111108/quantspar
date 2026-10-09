@@ -138,6 +138,10 @@ class QuantizedLinear(nn.Linear):
         self.layer_idx = 0
 
         self.outlier_ratio = outlier_ratio
+        # Element-wise weight outlier selection unioned into the channel mask
+        # during both calibration and the sidepath forward (reference behavior:
+        # outliermore=True keeps weight-side top-k elements on the FP16 path).
+        self.outliermore = True
         self.calibration_policy = "recalibrate"
         self._calibration_action_cache = None
 
@@ -339,18 +343,15 @@ class QuantizedLinear(nn.Linear):
             return out
         # Calculate weight and activation scales from FP values
         if self.outlier_ratio > 0.0:
-            outliermore = True
             channel_mask = self.get_outlier_mask_channel(x, self.outlier_ratio)
 
             x_channel_mask = channel_mask.view(1, 1, -1)   # [1, 1, H]
             w_channel_mask = channel_mask.view(1, -1)      # [1, H]
             del channel_mask
-            if outliermore:
+            if self.outliermore:
                 w_outlier_mask = self._get_outlier_mask_1d(self.weight, self.outlier_ratio)
                 w_channel_mask = w_channel_mask | w_outlier_mask
                 del w_outlier_mask
-            else:
-                pass
             x_normal_fp = x * (~x_channel_mask).to(dtype=x.dtype)
             x_normal_fp = x_normal_fp.to(torch.float32)
 
@@ -1024,11 +1025,18 @@ class QuantizedLinear(nn.Linear):
         return out_real
 
     def _split_outlier_operands(self, x):
-        """Return full-shape normal/protected tensors; masked zeros stay present."""
+        """Return full-shape normal/protected tensors; masked zeros stay present.
+
+        The weight mask unions the activation-derived outlier channel mask with
+        an element-wise weight top-k mask when ``outliermore`` is enabled
+        (default), matching the reference calibration-side logic.
+        """
         channels = self.get_outlier_mask_channel(x, self.outlier_ratio)
         x_mask = channels.view(*([1] * (x.ndim - 1)), -1)
-        w_mask = channels.view(1, -1) | self._get_outlier_mask_1d(
-            self.weight, self.outlier_ratio)
+        w_mask = channels.view(1, -1)
+        if self.outliermore:
+            w_mask = w_mask | self._get_outlier_mask_1d(
+                self.weight, self.outlier_ratio)
         x_float, w_float = x.float(), self.weight.float()
         return (x_float.masked_fill(x_mask, 0),
                 w_float.masked_fill(w_mask, 0),
