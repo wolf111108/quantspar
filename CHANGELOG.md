@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-09 — Add quick Qwen7B Linear scale PPL diagnostics
+
+- 目的：定位 Qwen2.5-7B 开启 Linear per-output-channel weight scale 后 PPL 由 19.0183 上升到 20.5306 的来源。
+- 内容：新增快速 FineWeb PPL 配置和可选 BF16、scalar/channel、Linear output/A/W 消融矩阵；各组独立校准 scale、运行日志及评测报告，支持配置指纹校验后的断点复用。新增仅在 PPL 评测时关闭操作数稀疏度采集的入口参数，保留校准、量化前向和默认行为；补充使用与结果判读文档。
+- 验证：仅执行 Python 语法检查、配置解析与所有消融组的静态断言、脚本 dry-run；按用户要求未运行模型或 PPL 实验。
+- 限制与旧结果影响：快速预算与原始 64×8192 校准及 65536 token 评测不同，PPL 只能用于初筛；旧量化行为和已有实验结果不变。关闭统计的实验没有逐层稀疏度报告，完整结果仍需用户本地复测。
+
 ## 2026-10-10 — Format tensor calibration scales in summaries
 
 - 目的：修复 Linear weight 使用 per-output-channel scale 时，calibration 汇总和保存日志仍按标量格式化 Tensor 导致流水线在 `Tensor.__format__` 处中断的问题。

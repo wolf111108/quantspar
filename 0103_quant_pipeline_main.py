@@ -71,6 +71,11 @@ def parse_args():
             "'pd' runs only prefill/decode profiling."  #add
         ),  #add
     )  #add
+    parser.add_argument(
+        "--ppl-only-no-stats",
+        action="store_true",
+        help="With --eval-flow=ppl, omit operand sparsity collection during evaluation.",
+    )
     parser.add_argument(  #add
         "--unit-bit-group-size",  #add
         type=int,  #add
@@ -500,19 +505,20 @@ def evaluate(args, config, model):
 
     # from quant.quant_moe_experts import QuantizedMoEExperts  # absent in this snapshot
 
+    eval_collector = None if args.ppl_only_no_stats else stat_manager
     for module in model.modules():  #add
         if isinstance(module, (QuantizedLinear, QuantizedMatMul)):
-            module._stat_manager = stat_manager  #add
+            module._stat_manager = eval_collector  #add
 
         # Qwen attention wrapper stores stat_manager on attention_module.  #add
         # Only rebind modules that actually own quantized attention matmuls.  #add
         if hasattr(module, "qk_matmul") or hasattr(module, "pv_matmul"):  #add
             if hasattr(module, "stat_manager"):  #add
-                module.stat_manager = stat_manager  #add
+                module.stat_manager = eval_collector  #add
             if hasattr(module, "qk_matmul"):  #add
-                module.qk_matmul._stat_manager = stat_manager  #add
+                module.qk_matmul._stat_manager = eval_collector  #add
             if hasattr(module, "pv_matmul"):  #add
-                module.pv_matmul._stat_manager = stat_manager  #add
+                module.pv_matmul._stat_manager = eval_collector  #add
 
 
     # ------------------------------------------------------------
@@ -707,7 +713,7 @@ def evaluate(args, config, model):
         None,
     )
 
-    if run_ppl:  #add
+    if run_ppl and not args.ppl_only_no_stats:  #add
         print("\n" + "-" * 80)  #add
         print("PPL FULL-FORWARD SPARSITY")  #add
         print("-" * 80)  #add
@@ -766,6 +772,8 @@ def evaluate(args, config, model):
             print(f"Collected layer CSV saved to: {collected_csv}")  #add
             print(f"Collected layer summary CSV appended to: {collected_summary_csv}")  #add
 
+    elif run_ppl:
+        print("\nSkipping PPL full-forward sparsity (--ppl-only-no-stats)")
     else:  #add
         print("\nSkipping PPL full-forward sparsity because --eval-flow=pd")  #add
 
@@ -995,6 +1003,8 @@ def evaluate(args, config, model):
 def main():
     """Main entry point."""
     args = parse_args()
+    if args.ppl_only_no_stats and args.eval_flow != "ppl":
+        raise ValueError("--ppl-only-no-stats requires --eval-flow=ppl")
     
     # Check if CUDA is available
     if args.device == "cuda" and not torch.cuda.is_available():

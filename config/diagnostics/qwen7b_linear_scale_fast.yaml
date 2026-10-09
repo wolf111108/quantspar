@@ -1,0 +1,58 @@
+# Qwen2.5-7B PPL diagnostic; the runner creates one isolated config per case.
+# Short data budgets rank cases quickly; confirm promising cases with full budgets.
+model:
+  name: qwen2.5-7b
+  family: qwen2
+  dtype: bf16
+  attn_implementation: eager
+quantization:
+  enabled: true
+  mode: quant_forward
+  model_family: qwen2
+  quantize_linear: true
+  quantize_matmul: true
+  mixed_precision: false
+  dynamic_activation: false
+  weight_scale_granularity: scalar
+  scale_dir: outputs/qwen7b_linear_scale_fast/template_unused
+  calibration_policy:
+    default: recalibrate
+  q_proj: {a_bit: e4m3, w_bit: e4m3, o_bit: e4m3, outlier_ratio: 0.03}
+  k_proj: {a_bit: e4m3, w_bit: e4m3, o_bit: e4m3, outlier_ratio: 0.03}
+  v_proj: {a_bit: e4m3, w_bit: e4m3, o_bit: e4m3, outlier_ratio: 0.03}
+  o_proj: {a_bit: e4m3, w_bit: e4m3, o_bit: e4m3, outlier_ratio: 0.03}
+  gate_proj: {a_bit: e4m3, w_bit: e4m3, o_bit: e4m3, outlier_ratio: 0.03}
+  up_proj: {a_bit: e4m3, w_bit: e4m3, o_bit: e4m3, outlier_ratio: 0.03}
+  down_proj: {a_bit: e4m3, w_bit: e4m3, o_bit: e4m3, outlier_ratio: 0.03}
+  qk_matmul: {A_bit: e4m3, B_bit: e4m3, O_bit: "none", outlier_ratio: 0.08}
+  pv_matmul: {A_bit: e4m3, B_bit: e4m3, O_bit: e4m3, outlier_ratio: 0.08}
+  lm_head: {enabled: false}
+calibration:
+  dataset: HuggingFaceFW/fineweb
+  dataset_config: sample-10BT
+  split: train
+  streaming: true
+  text_column: text
+  min_text_tokens: 256
+  num_samples: 8
+  seq_length: 1024
+  batch_size: 1
+  seed: 23
+evaluation:
+  seq_length: 2048
+  max_eval_tokens: 8192
+  min_doc_tokens: 256
+  datasets:
+    - alias: fineweb
+      name: HuggingFaceFW/fineweb
+      config: sample-10BT
+      split: train
+      streaming: true
+      text_column: text
+      seq_length: 2048
+      max_eval_tokens: 8192
+      min_doc_tokens: 256
+prefill_decode_profile:
+  enabled: false
+unit_sparsity:
+  enabled: false
