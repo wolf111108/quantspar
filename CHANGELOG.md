@@ -2,14 +2,19 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-09 — Promote outliermore to a default-on instance flag
+
+- 目的：把 outlier 掩码中硬编码在函数内的 `outliermore = True` 显式化为实例属性，允许按层关闭 weight 自身 element-wise top-k 并集（仅保留激活 channel mask 掩 weight 列），与用户参考代码的结构对齐；行为保持不变。
+- 内容：`quant/quant_linear.py` 新增 `self.outliermore = True`（`__init__`），`scale_inspection_bitnet` 与 `_split_outlier_operands` 改读该属性；`quant/quant_matmul.py` 的 `_split_outlier_operands` 中 B 侧 element-wise 并集同样受 `getattr(self, "outliermore", True)` 控制。掩码语义（weight = 激活 channel mask ∪ element-wise top-k）、数值、统计口径均无变化。
+- 验证：smtqt 环境下 `tests/test_outlier_sparsity.py`（含逐 bit W codes 断言）、`tests/test_bit_sparsity_pipeline.py`、`tests/test_sparsity_ppl_matrix.py` 共 29 项测试加 71 子测试全部通过；新旧实现双路径数值对照确认正常/小 scale 下输出一致。
+- 限制与旧结果影响：默认行为与既有实验完全一致，所有已产出结果（主矩阵、三轮翻倍、doubling）不受影响，无需重跑。若手动设 `outliermore = False` 则改变掩码语义，属新实验口径，需重新校准并独立目录。
+
 ## 2026-10-08 — Fix evaluation report flow key mismatch failing matrix validation
 
 - 目的：修复重跑矩阵把成功流水线误判为 failed 的问题。真实运行中流水线退出码 0、PPL 正常、stats 文件齐全，但 runner 校验 `evaluation.json` 时报 "Missing or incompatible full_forward bit statistics"。
 - 内容：`0103_quant_pipeline_main.py` 将 PPL full-forward 快照写入 `sparsity_summaries` 的键从 `"ppl"` 改为 `"full_forward"`，与 stats 文件名后缀、`scripts/evaluation_report.py` 的 artifacts 指纹查找及 `scripts/run_sparsity_ppl_matrix.py` 的 `read_report` 校验三方对齐。旧键还导致 `artifacts.ppl` 指纹查找落空（找 `..._ppl_bit_sparsity.*` 不存在），即使 runner 认键也无法通过 SHA256 校验。同步更新 `tests/test_bit_sparsity_pipeline.py` 中 TXT 摘要的键名断言。单测原先用合成报告（直接写 `full_forward` 键）故未覆盖真实流水线的键名。
 - 验证：smtqt 环境（PyTorch 2.6.0+cpu、Transformers 4.43.1）下 `tests/test_sparsity_ppl_matrix.py` 与 `tests/test_bit_sparsity_pipeline.py` 共 18 项测试加 31 子测试全部通过；py_compile 通过。base 环境因 torch 过旧无 `float8_e4m3fn` 与本次修改无关。
 - 限制与旧结果影响：`source_digest` 含主入口文件，fingerprint 变化使 `--resume` 无法复用修复前的 attempt；`outputs/sparsity_ppl_rerun` 下修复前的 attempt（含 PPL=14.4414 的 opt_1.3b_bf16_bf16 等）报告键名错误且内嵌旧指纹，不进入新 summary。实测重跑 4 个 opt-1.3b 任务 PPL 与旧 attempt bit 级一致（14.441374778747559 / 14.9683837890625 / 131.02838134765625 / 277.5075988769531），可复现。运行注意事项：矩阵 fingerprint 含 `runtime_versions()`（torch/transformers 版本），必须始终用同一环境（smtqt）启动，`${PYTHON:-python}` 在错误 conda 环境下会因缺 transformers qwen2 模块秒失败，且会把 manifest 指纹覆盖为错误环境的值导致 resume 失效；误跑后需以正确环境重算指纹并恢复 completed 状态。
-
-
 
 - 目的：按截图中 GPT-2 以外的三个模型、五种 A/W 格式创建可本地重跑的配置与脚本，重新采集比特稀疏度和 PPL，包括旧 NaN 项。
 - 内容：新增 OPT-1.3B、OPT-6.7B、Qwen2.5-7B × BF16/BF16、E4M3FN/E4M3FN、INT8/INT8、INT8/INT4、E4M3FN/INT4 共 15 份 YAML；全部显式 BF16 加载、eager、关闭 mixed precision/unit，使用 FineWeb sample-10BT/train、64 校准样本/seed23、统一 65536 输入 token PPL 预算，OPT 长度 2048、Qwen 长度 8192。量化组 Linear outlier=0.0001，BF16 与 QK/PV 为零；K/V 跟随 A 格式。新增逐组子进程 Python/Shell 脚本、独立 attempt/scales、dry-run/子集/resume/outlier 覆盖、失败继续与退出码；主入口新增完整数值 PPL/阶段快照 JSON，脚本导出 summary JSON/CSV 与操作数原始计数 CSV，比例按分子/分母加权，NaN 保留 null/status。更新 README 和专门运行说明。

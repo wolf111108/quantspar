@@ -319,6 +319,87 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(by_name["opt_1.3b_bf16_bf16"]["rounds"], "1")
         self.assertEqual(by_name["opt_1.3b_bf16_bf16"]["rounds"], "1")
 
+    def test_doubling_init_ratio_rounds_from_explicit_start(self):
+        from scripts import run_sparsity_ppl_doubling as doubling
+        script_ppl = {"opt_1.3b_fp8_int4": 26.0}
+        calls = []
+        real_run_matrix = runner.run_matrix
+
+        def fake_run_matrix(runner_args, executor=None):
+            calls.append(runner_args)
+            def exec_one(command, *, cwd, stdout, stderr, check):
+                self.calls.append(command)
+                return self.executor(command, cwd=cwd, stdout=stdout, stderr=stderr, check=check,
+                                     outcomes={command[command.index("--run-name") + 1]: 26.0})
+            return real_run_matrix(runner_args, executor=exec_one)
+
+        base = doubling.parse_args([
+            "--models", "opt-1.3b", "--formats", "fp8_int4",
+            "--opt-1-3b-path", str(self.checkpoint), "--ppl-threshold", "20",
+            "--init-ratio", "0.0004", "--init-qk-pv-ratio", "0.0004",
+            "--output-dir", str(self.root / "doubling_init")])
+        with mock.patch.object(doubling.runner, "run_matrix", new=fake_run_matrix), \
+             contextlib.redirect_stdout(io.StringIO()):
+            code = doubling.run_doubling(base)
+        self.assertEqual(code, 1)  # 26 > 20 keeps doubling until max-rounds
+        # Round 1 uses the explicit init ratios; round 2 doubles from them.
+        self.assertEqual(calls[0].outlier_ratio, 0.0004)
+        self.assertEqual(calls[0].qk_pv_outlier_ratio, 0.0004)
+        self.assertEqual(calls[1].outlier_ratio, 0.0008)
+        self.assertEqual(calls[1].qk_pv_outlier_ratio, 0.0008)
+        rows = list(csv.DictReader((self.root / "doubling_init" / "doubling_summary.csv").open()))
+        self.assertEqual(rows[0]["final_linear_outlier_ratio"], repr(min(0.0004 * 2 ** 7, 0.1)))
+        self.assertEqual(rows[0]["linear_history"].split(";")[0], "0.0004")
+
+    def test_doubling_init_results_seeds_and_skips_round_one(self):
+        from scripts import run_sparsity_ppl_doubling as doubling
+        calls = []
+        real_run_matrix = runner.run_matrix
+        # A previous experiment summary: fp8_int4 already measured at 4e-4/4e-4.
+        prev = self.root / "prev"
+        prev.mkdir()
+        with (prev / "summary.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["run_name", "ppl", "status",
+                                                        "linear_outlier_ratio", "qk_pv_outlier_ratio"])
+            writer.writeheader()
+            writer.writerow(dict(run_name="opt_1.3b_fp8_int4", ppl="26.0", status="completed",
+                                 linear_outlier_ratio="0.0004", qk_pv_outlier_ratio="0.0004"))
+
+        def fake_run_matrix(runner_args, executor=None):
+            calls.append(runner_args)
+            def exec_one(command, *, cwd, stdout, stderr, check):
+                self.calls.append(command)
+                return self.executor(command, cwd=cwd, stdout=stdout, stderr=stderr, check=check,
+                                     outcomes={command[command.index("--run-name") + 1]: 26.0})
+            return real_run_matrix(runner_args, executor=exec_one)
+
+        base = doubling.parse_args([
+            "--models", "opt-1.3b", "--formats", "fp8_int4",
+            "--opt-1-3b-path", str(self.checkpoint), "--ppl-threshold", "20",
+            "--init-ratio", "0.0004", "--init-qk-pv-ratio", "0.0004",
+            "--init-results", str(prev), "--output-dir", str(self.root / "doubling_seed")])
+        with mock.patch.object(doubling.runner, "run_matrix", new=fake_run_matrix), \
+             contextlib.redirect_stdout(io.StringIO()):
+            code = doubling.run_doubling(base)
+        self.assertEqual(code, 1)  # 26 > 20 keeps doubling
+        self.assertEqual(len(calls), 8)  # seeded group: rounds 1..8 dispatch 8e-4 .. 0.1 (capped)
+        self.assertEqual(calls[0].outlier_ratio, 0.0008)  # first dispatch doubles the seeded 4e-4
+        self.assertTrue((self.root / "doubling_seed" / "round_01").is_dir())  # doubling starts in round_01
+        rows = list(csv.DictReader((self.root / "doubling_seed" / "doubling_summary.csv").open()))
+        self.assertEqual(rows[0]["ppl_history"].split(";")[0], "26.0")  # seeded PPL recorded as round 1
+
+        # Mismatched seed ratios must be rejected.
+        with (prev / "summary.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["run_name", "ppl", "status",
+                                                        "linear_outlier_ratio", "qk_pv_outlier_ratio"])
+            writer.writeheader()
+            writer.writerow(dict(run_name="opt_1.3b_fp8_int4", ppl="26.0", status="completed",
+                                 linear_outlier_ratio="0.0002", qk_pv_outlier_ratio="0.0002"))
+        with mock.patch.object(doubling.runner, "run_matrix", new=fake_run_matrix), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "do not match"):
+                doubling.run_doubling(base)
+
     def test_doubling_stops_at_ratio_cap(self):
         from scripts import run_sparsity_ppl_doubling as doubling
         calls = []

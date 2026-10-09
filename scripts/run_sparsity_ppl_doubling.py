@@ -1,19 +1,16 @@
 """Iteratively double outlier ratios until every group's PPL is below a threshold.
 
-Round 1 runs the selected model/format matrix with template defaults. After each
-round, groups whose FineWeb PPL exceeds --ppl-threshold get both their Linear and
-QK/PV outlier ratios doubled (a zero ratio starts from --seed-ratio) and are
-rerun alone in a fresh round_NN directory. The loop stops when every group is
-below the threshold, when no failing group can still be doubled (--max-ratio),
-or after --max-rounds. A zero ratio only starts from the seed; ratios never
-exceed --max-ratio. Run from the repository root, e.g.:
-
-    python -m scripts.run_sparsity_ppl_doubling \
-        --opt-1-3b-path /path/to/opt-1.3b --opt-6-7b-path /path/to/opt-6.7b \
-        --qwen-7b-path /path/to/Qwen2.5-7B --ppl-threshold 20
-
-Each failing job is dispatched as its own runner invocation (one model, one
-format, one ratio pair) because ratios diverge per group across rounds; runner
+Round 1 runs the selected model/format matrix with template defaults, or with
+--init-ratio/--init-qk-pv-ratio when continuing from a previous manual experiment
+(e.g. --init-ratio 0.0004 --init-qk-pv-ratio 0.0004 resumes after a 4e-4 round;
+round 2 then starts doubling from 8e-4). After each round, groups whose FineWeb
+PPL exceeds --ppl-threshold get both their Linear and QK/PV outlier ratios
+doubled (a zero ratio starts from --seed-ratio) and are rerun alone in a fresh
+round_NN directory. The loop stops when every group is below the threshold,
+when no failing group can still be doubled (--max-ratio), or after --max-rounds.
+A zero ratio only starts from the seed; ratios never exceed --max-ratio. Each
+failing job is dispatched as its own runner invocation (one model, one format,
+one ratio pair) because ratios diverge per group across rounds; runner
 invocations into the same round directory accumulate one manifest/summary.
 """
 
@@ -48,6 +45,15 @@ def parse_args(argv=None):
                         help="Hard cap for both outlier ratios; failing groups already at the cap stop")
     parser.add_argument("--seed-ratio", type=float, default=0.0001,
                         help="First ratio for a group whose previous ratio was zero")
+    parser.add_argument("--init-ratio", type=runner.outlier_ratio, default=None,
+                        help="Start round 1 with this Linear outlier ratio instead of template defaults")
+    parser.add_argument("--init-qk-pv-ratio", type=runner.outlier_ratio, default=None,
+                        help="Start round 1 with this QK/PV outlier ratio; defaults to --init-ratio")
+    parser.add_argument("--init-results", type=Path, default=None,
+                        help="Seed PPL values from a previous experiment's summary.csv matching "
+                             "--init-ratio/--init-qk-pv-ratio, skipping a redundant round 1 re-run; "
+                             "groups found there enter round 2 (doubling) directly, missing groups "
+                             "still run round 1 with the init ratios")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/sparsity_ppl_doubling"))
     return parser.parse_args(argv)
 
@@ -71,6 +77,18 @@ def read_round_ppl(round_dir):
         for row in csv.DictReader(handle):
             value = row.get("ppl")
             result[row["run_name"]] = (float(value) if value not in ("", None) else None, row["status"])
+    return result
+
+
+def seeded_ratios(round_dir):
+    """Map run_name -> (linear_ratio, qk_pv_ratio) recorded in a summary.csv."""
+    result = {}
+    with (round_dir / "summary.csv").open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                result[row["run_name"]] = (float(row["linear_outlier_ratio"]), float(row["qk_pv_outlier_ratio"]))
+            except (KeyError, TypeError, ValueError):
+                continue
     return result
 
 
@@ -113,17 +131,60 @@ def run_doubling(args, executor=None):
 
     root = args.output_dir.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    state = {f"{MODELS[model][0]}_{fmt}": {"model": model, "format": fmt, "linear": None, "qk_pv": None,
+    init = (args.init_ratio, args.init_qk_pv_ratio if args.init_qk_pv_ratio is not None else args.init_ratio)
+    state = {f"{MODELS[model][0]}_{fmt}": {"model": model, "format": fmt, "linear": init[0], "qk_pv": init[1],
                                            "ppl": None, "status": "pending",
                                            "ppl_history": [], "linear_history": [], "qk_pv_history": []}
              for model in args.models for fmt in args.formats}
+    seeded = set()
+    if args.init_results is not None:
+        if init[0] is None:
+            raise ValueError("--init-results requires --init-ratio describing the seeded experiment's ratios")
+        seeded_ppl = read_round_ppl(args.init_results.expanduser().resolve())
+        for name, entry in state.items():
+            if name not in seeded_ppl:
+                continue
+            ppl, status = seeded_ppl[name]
+            if ppl is None:
+                continue
+            row_ratio = seeded_ratios(args.init_results.expanduser().resolve()).get(name)
+            if row_ratio is not None and tuple(row_ratio) != init:
+                raise ValueError(f"{name}: seeded ratios {row_ratio} do not match --init-ratio {init}")
+            entry.update(ppl=ppl, status=status, seeded=True)
+            entry["ppl_history"].append(ppl)
+            entry["linear_history"].append(init[0])
+            entry["qk_pv_history"].append(init[1])
+            seeded.add(name)
+        print(f"Seeded {len(seeded)} group(s) from {args.init_results}; they skip round 1 and start doubling",
+              flush=True)
     threshold = args.ppl_threshold
 
     for round_index in range(1, args.max_rounds + 1):
         round_dir = root / f"round_{round_index:02d}"
         if round_index == 1:
-            schedule = list(state)  # everyone starts with template defaults
-            overrides = {name: (None, None) for name in schedule}
+            schedule = [name for name in state if name not in seeded]
+            overrides = {name: init for name in schedule}
+            for name in schedule:  # record the explicit starting ratios for round 2 doubling
+                state[name]["linear"], state[name]["qk_pv"] = init
+            if not schedule:  # everything seeded: run the first doubling round inside round_01
+                failing = [name for name, entry in state.items()
+                           if entry["ppl"] is None or entry["ppl"] > threshold]
+                if not failing:
+                    break
+                schedule, overrides = [], {}
+                for name in failing:
+                    entry = state[name]
+                    linear, qk_pv = doubled(entry["linear"], args), doubled(entry["qk_pv"], args)
+                    if linear == entry["linear"] and qk_pv == entry["qk_pv"]:
+                        entry["exhausted"] = True
+                        print(f"{name}: at ratio cap {args.max_ratio} with PPL={entry['ppl']}; stop doubling",
+                              flush=True)
+                        continue
+                    entry["linear"], entry["qk_pv"] = linear, qk_pv
+                    schedule.append(name)
+                    overrides[name] = (linear, qk_pv)
+                if not schedule:
+                    break
         else:
             failing = [name for name, entry in state.items()
                        if entry["ppl"] is None or entry["ppl"] > threshold]
