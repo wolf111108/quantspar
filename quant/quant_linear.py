@@ -139,10 +139,6 @@ class QuantizedLinear(nn.Linear):
         self.layer_idx = 0
 
         self.outlier_ratio = outlier_ratio
-        # Element-wise weight outlier selection unioned into the channel mask
-        # during both calibration and the sidepath forward (reference behavior:
-        # outliermore=True keeps weight-side top-k elements on the FP16 path).
-        self.outliermore = True
         self.calibration_policy = "recalibrate"
         self._calibration_action_cache = None
 
@@ -344,15 +340,9 @@ class QuantizedLinear(nn.Linear):
             return out
         # Calculate weight and activation scales from FP values
         if self.outlier_ratio > 0.0:
-            channel_mask = self.get_outlier_mask_channel(x, self.outlier_ratio)
-
-            x_channel_mask = channel_mask.view(1, 1, -1)   # [1, 1, H]
-            w_channel_mask = channel_mask.view(1, -1)      # [1, H]
-            del channel_mask
-            if self.outliermore:
-                w_outlier_mask = self._get_outlier_mask_1d(self.weight, self.outlier_ratio)
-                w_channel_mask = w_channel_mask | w_outlier_mask
-                del w_outlier_mask
+            channel_mask = self._get_operand_outlier_channels(x)
+            x_channel_mask = channel_mask.view(*([1] * (x.ndim - 1)), -1)
+            w_channel_mask = channel_mask.view(1, -1)
             x_normal_fp = x * (~x_channel_mask).to(dtype=x.dtype)
             x_normal_fp = x_normal_fp.to(torch.float32)
 
@@ -1031,19 +1021,17 @@ class QuantizedLinear(nn.Linear):
 
         return out_real
 
-    def _split_outlier_operands(self, x):
-        """Return full-shape normal/protected tensors; masked zeros stay present.
+    def _get_operand_outlier_channels(self, x):
+        """Select input channels from activation and weight, then take their union."""
+        activation_channels = self.get_outlier_mask_channel(x, self.outlier_ratio)
+        weight_channels = self.get_outlier_mask_channel(self.weight, self.outlier_ratio)
+        return activation_channels | weight_channels
 
-        The weight mask unions the activation-derived outlier channel mask with
-        an element-wise weight top-k mask when ``outliermore`` is enabled
-        (default), matching the reference calibration-side logic.
-        """
-        channels = self.get_outlier_mask_channel(x, self.outlier_ratio)
+    def _split_outlier_operands(self, x):
+        """Return full-shape normal/protected tensors; masked zeros stay present."""
+        channels = self._get_operand_outlier_channels(x)
         x_mask = channels.view(*([1] * (x.ndim - 1)), -1)
         w_mask = channels.view(1, -1)
-        if self.outliermore:
-            w_mask = w_mask | self._get_outlier_mask_1d(
-                self.weight, self.outlier_ratio)
         x_float, w_float = x.float(), self.weight.float()
         return (x_float.masked_fill(x_mask, 0),
                 w_float.masked_fill(w_mask, 0),
@@ -1248,44 +1236,8 @@ class QuantizedLinear(nn.Linear):
 
         return out
 
-    def _get_outlier_mask_1d(self, tensor: torch.Tensor, ratio: float) -> torch.Tensor:
-        """
-        返回 bool mask，True 表示是 outlier（保留 FP16）。
-        离群值定义为绝对值最大的元素，数量约占总元素数的 ratio（至少1个，最多 numel-1 个）。
-        当所有元素绝对值相等时，返回全 False。
-        """
-        if ratio <= 0.0:
-            return torch.zeros(tensor.shape, dtype=torch.bool, device=tensor.device)
-
-        numel = tensor.numel()
-        if numel == 0:
-            return torch.zeros(tensor.shape, dtype=torch.bool, device=tensor.device)
-
-        # 至少选1个，最多选 numel-1 个，确保正常部分非空
-        k = max(1, min(int(numel * ratio), numel - 1))
-
-        flat_abs = tensor.abs().flatten()
-        # 获取第 k 大的值
-        threshold = torch.topk(flat_abs, k).values.min()
-
-        # 处理阈值等于最小值的情况
-        min_val = flat_abs.min()
-        if threshold == min_val:
-            # 只选严格大于最小值的元素，避免全选
-            outlier_mask_flat = flat_abs > min_val
-        else:
-            outlier_mask_flat = flat_abs >= threshold
-
-        # 如果离群数量为0（如全等值），返回全False
-        if outlier_mask_flat.sum() == 0:
-            return torch.zeros(tensor.shape, dtype=torch.bool, device=tensor.device)
-
-        # 恢复原始形状
-        return outlier_mask_flat.view(tensor.shape)
-
-
     def get_outlier_mask_channel(self, tensor: torch.Tensor, ratio: float) -> torch.Tensor:
-        """带 outlier 保护的量化前向计算。"""
+        """Select top input channels by peak absolute value."""
 
         if not 0 <= ratio <= 1:
             raise ValueError("outlier_ratio must be in [0, 1]")

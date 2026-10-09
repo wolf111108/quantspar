@@ -2,6 +2,13 @@
 
 每次提交在同一提交中增加一条，记录目的、内容、验证和限制。当前提交用与 commit message 一致的标题标识；提交前不填自身 SHA。规则见 [AGENTS.md](AGENTS.md)。
 
+## 2026-10-09 — Union activation and weight outlier channels
+
+- 目的：按相同 outlier ratio 独立寻找乘法两侧的大幅值归约通道，并在两侧使用同一个并集 mask。
+- 内容：Linear 分别从激活和权重的输入列选通道；QK/PV MatMul 分别从 A 的末维和 B 的倒数第二维选通道。两侧各选 `max(1, int(K * ratio))`，取并集后共同分离 normal/protected；Linear 的普通校准和 BitNet 校准也使用该 mask。删除按元素权重 mask 函数与不再生效的 outliermore 开关，更新相关断言和统计说明。输出通道自身的 mask 仍按输出选择。
+- 验证：按用户要求，本次未运行测试或模型实验；仅核对远端最新代码与改动范围。
+- 限制与旧结果影响：并集最多包含两侧各自选中的通道数，通常多于原先仅由激活选中的通道；权重按元素 top-k 的保护取消。normal 张量的校准范围、量化结果、mask 人为零及 PPL 均可能改变，旧 scales 和稀疏度/PPL 结果应重新校准和采集。高精度 protected 部分仍不计入比特稀疏度。
+
 ## 2026-10-09 — Aggregate calibration scales and couple outlier ratio overrides
 
 - 目的：修复量化校准只保留最后一个 batch 的 A/W/O scale，并避免矩阵脚本单独覆盖 Linear 旁路时误以为 QK/PV 也跟随。

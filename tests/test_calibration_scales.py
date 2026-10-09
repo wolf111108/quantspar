@@ -46,16 +46,15 @@ class CalibrationScaleTests(unittest.TestCase):
 
     def test_masked_weight_channel_scales_keep_earlier_batch(self):
         layer = QuantizedLinear(
-            2, 2, bias=False, mode="scale_inspection",
+            3, 2, bias=False, mode="scale_inspection",
             a_bit=8, w_bit=8, o_bit=8,
-            outlier_ratio=0.5, weight_scale_granularity="output_channel",
+            outlier_ratio=0.34, weight_scale_granularity="output_channel",
         )
-        layer.outliermore = False
         with torch.no_grad():
-            layer.weight.copy_(torch.tensor([[2., 9.], [5., 7.]]))
-        layer.scale_inspection(torch.tensor([[10., 1.]]))
+            layer.weight.copy_(torch.tensor([[9., 2., 1.], [8., 5., 1.]]))
+        layer.scale_inspection(torch.tensor([[10., 1., 1.]]))
         first = layer.w_interval.clone()
-        layer.scale_inspection(torch.tensor([[1., 10.]]))
+        layer.scale_inspection(torch.tensor([[1., 1., 10.]]))
         self.assertTrue(torch.equal(layer.w_interval, first))
         self.assertEqual(tuple(layer.w_interval.shape), (2,))
 

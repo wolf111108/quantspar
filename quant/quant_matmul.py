@@ -451,19 +451,14 @@ class QuantizedMatMul(nn.Module):
 
 
     def _split_outlier_operands(self, A, B):
-        """Protect paired reduction channels, including square QK/PV operands.
-
-        When ``outliermore`` is enabled (default), B additionally keeps its own
-        element-wise top-k outliers on the FP16 path, matching the Linear-side
-        reference behavior.
-        """
+        """Protect the union of both operands' reduction channels."""
         if A.ndim < 2 or B.ndim < 2 or A.shape[-1] != B.shape[-2]:
             raise ValueError("Outlier MatMul requires A[..., M, K] and B[..., K, N]")
-        channels = self.get_outlier_mask_channel(A, self.outlier_ratio)
+        channels = (self.get_outlier_mask_channel(A, self.outlier_ratio)
+                    | self.get_outlier_mask_channel(B, self.outlier_ratio,
+                                                    channel_dim=-2))
         A_mask = channels.view(*([1] * (A.ndim - 1)), -1)
         B_mask = channels.view(*([1] * (B.ndim - 2)), -1, 1)
-        if getattr(self, "outliermore", True):
-            B_mask = B_mask | self._get_outlier_mask_1d(B, self.outlier_ratio)
         A_float, B_float = A.float(), B.float()
         return (A_float.masked_fill(A_mask, 0),
                 B_float.masked_fill(B_mask, 0),
@@ -753,17 +748,18 @@ class QuantizedMatMul(nn.Module):
         ).to(torch.float32)
         return code, scale, code * scale
 
-    def get_outlier_mask_channel(self, tensor: torch.Tensor, ratio: float) -> torch.Tensor:
-        """带 outlier 保护的量化前向计算。"""
-
+    def get_outlier_mask_channel(
+        self, tensor: torch.Tensor, ratio: float, channel_dim: int = -1
+    ) -> torch.Tensor:
+        """Select top channels by peak magnitude across all other dimensions."""
         if not 0 <= ratio <= 1:
             raise ValueError("outlier_ratio must be in [0, 1]")
+        channel_dim %= tensor.ndim
         if ratio == 0 or tensor.numel() == 0:
-            return torch.zeros(tensor.shape[-1], dtype=torch.bool, device=tensor.device)
+            return torch.zeros(tensor.shape[channel_dim], dtype=torch.bool, device=tensor.device)
 
-        # 兼容 [B, S, H] 和 [1, H] / [S, H] / [H] 等各种情况
-        tensor_2d = tensor.reshape(-1, tensor.shape[-1])   # [N, H]
-        channel_score = tensor_2d.abs().amax(dim=0)        # [H]
+        other_dims = tuple(dim for dim in range(tensor.ndim) if dim != channel_dim)
+        channel_score = tensor.abs().amax(dim=other_dims) if other_dims else tensor.abs()
 
         k = max(1, int(channel_score.numel() * ratio))
 
@@ -815,42 +811,6 @@ class QuantizedMatMul(nn.Module):
         out = self._matmul(A, B)
 
         return out
-
-    def _get_outlier_mask_1d(self, tensor: torch.Tensor, ratio: float) -> torch.Tensor:
-        """
-        返回 bool mask，True 表示是 outlier（保留 FP16）。
-        离群值定义为绝对值最大的元素，数量约占总元素数的 ratio（至少1个，最多 numel-1 个）。
-        当所有元素绝对值相等时，返回全 False。
-        """
-        if ratio <= 0.0:
-            return torch.zeros(tensor.shape, dtype=torch.bool, device=tensor.device)
-    
-        numel = tensor.numel()
-        if numel == 0:
-            return torch.zeros(tensor.shape, dtype=torch.bool, device=tensor.device)
-    
-        # 至少选1个，最多选 numel-1 个，确保正常部分非空
-        k = max(1, min(int(numel * ratio), numel - 1))
-    
-        flat_abs = tensor.abs().flatten()
-        # 获取第 k 大的值
-        threshold = torch.topk(flat_abs, k).values.min()
-    
-        # 处理阈值等于最小值的情况
-        min_val = flat_abs.min()
-        if threshold == min_val:
-            # 只选严格大于最小值的元素，避免全选
-            outlier_mask_flat = flat_abs > min_val
-        else:
-            outlier_mask_flat = flat_abs >= threshold
-    
-        # 如果离群数量为0（如全等值），返回全False
-        if outlier_mask_flat.sum() == 0:
-            return torch.zeros(tensor.shape, dtype=torch.bool, device=tensor.device)
-    
-        # 恢复原始形状
-        return outlier_mask_flat.view(tensor.shape)
-
 
     def _load_scales(self):
         A_scale_file, B_scale_file, O_scale_file = self._scale_file_paths()

@@ -59,6 +59,8 @@ class OutlierSparsityTests(unittest.TestCase):
         first = torch.tensor([[9., 1., 1., 1.]])
         second = torch.tensor([[1., 1., 9., 1.]])
         self.calibrate(op, first)
+        self.assertEqual(op._get_operand_outlier_channels(first).tolist(), [True, False, False, True])
+        self.assertEqual(op._get_operand_outlier_channels(second).tolist(), [False, False, True, True])
         sm = self.manager()
         with mock.patch('quant.stat_manager.measure_mapping', side_effect=AssertionError('mapping called')), \
              mock.patch('quant.stat_manager.unit_sparse_counts', side_effect=AssertionError('units called')):
@@ -75,11 +77,11 @@ class OutlierSparsityTests(unittest.TestCase):
         self.assertEqual(weight['zero_bits'], expected_weight_zeros)
         self.assertEqual(weight['observations'], 2)
         self.assertEqual(weight['counting'], 'each_quantized_forward')
-        self.assertEqual(activation['zero_elements'], 2)
+        self.assertEqual(activation['zero_elements'], 4)
         self.assertEqual(activation['bits'], 24)
-        self.assertEqual(activation['zero_bits'], 12)  # zero + three native 0x7e codes per call
+        self.assertEqual(activation['zero_bits'], 16)  # two zero mantissas and two 0x7e codes per call
         self.assertEqual(doc['total']['bits'], 88)
-        self.assertEqual(doc['total']['bit_zero_ratio'], (12 + expected_weight_zeros)/88)
+        self.assertEqual(doc['total']['bit_zero_ratio'], (16 + expected_weight_zeros)/88)
         self.assertEqual(sm._static_weight_counts, {})
         self.assertTrue(all(row['outlier_masked'] for row in doc['records']))
         self.assertEqual(doc['schema_version'], 2)
@@ -104,9 +106,10 @@ class OutlierSparsityTests(unittest.TestCase):
                         op.weight.copy_(weight); op.bias.copy_(bias)
                     x = torch.tensor([9., 1., .3, .2]).expand(shape).clone()
                     self.calibrate(op, x)
-                    x_mask = torch.zeros_like(x, dtype=torch.bool); x_mask[..., 0] = True
+                    x_mask = torch.zeros_like(x, dtype=torch.bool)
+                    x_mask[..., 0] = True; x_mask[..., 3] = True
                     w_mask = torch.zeros_like(weight, dtype=torch.bool)
-                    w_mask[:, 0] = True; w_mask[0, 3] = True
+                    w_mask[:, 0] = True; w_mask[:, 3] = True
                     x_normal, w_normal = x.masked_fill(x_mask, 0), weight.masked_fill(w_mask, 0)
                     xs = reference_codes(x_normal, op.a_interval, op.a_spec) * op.a_interval
                     ws = reference_codes(w_normal, op.w_interval[:, None], op.w_spec) * op.w_interval[:, None]
@@ -133,7 +136,7 @@ class OutlierSparsityTests(unittest.TestCase):
         wide = QuantizedLinear(4, 2, bias=False, a_bit=16, w_bit=16, o_bit='none',
             outlier_ratio=.0001, scale_root_str=self.tmp.name).half()
         with torch.no_grad():
-            wide.weight.fill_(1)
+            wide.weight.copy_(torch.tensor([[1.5, 1., 1., 1.]] * 2))
         half_input = torch.tensor([[40000., 1003., .125, -1000.]], dtype=torch.float16)
         self.calibrate(wide, half_input)
         sm = self.manager()
@@ -159,11 +162,14 @@ class OutlierSparsityTests(unittest.TestCase):
                                 outlier_ratio=.0001, scale_root_str=self.tmp.name)
                             op.set_layer_info(name, 0)
                             self.calibrate(op, A, B)
-                            am = torch.zeros_like(A, dtype=torch.bool); am[...,3] = True
+                            am = torch.zeros_like(A, dtype=torch.bool)
+                            am[...,0] = True; am[...,3] = True
                             bm = torch.zeros_like(B, dtype=torch.bool)
-                            bm[...,3,:] = True; bm[...,0,1] = True
+                            bm[...,0,:] = True; bm[...,3,:] = True
                             an, bn = A.masked_fill(am, 0), B.masked_fill(bm, 0)
-                            torch.testing.assert_close(op._split_outlier_operands(A, B)[1], bn, rtol=0, atol=0)
+                            split = op._split_outlier_operands(A, B)
+                            torch.testing.assert_close(split[0], an, rtol=0, atol=0)
+                            torch.testing.assert_close(split[1], bn, rtol=0, atol=0)
                             ac = reference_codes(an, op.A_interval, op.A_spec)
                             bc = reference_codes(bn, op.B_interval, op.B_spec)
                             ad, bd = ac*op.A_interval, bc*op.B_interval
